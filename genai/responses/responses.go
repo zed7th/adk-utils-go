@@ -280,9 +280,10 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 		}
 	}
 
-	// Structured output with schema
+	// Structured output with schema (also strict-normalised)
 	if cfg.ResponseSchema != nil {
 		if schemaMap, err := convertSchema(cfg.ResponseSchema); err == nil {
+			normalizeStrictSchema(schemaMap)
 			params.Text = responses.ResponseTextConfigParam{
 				Format: responses.ResponseFormatTextConfigUnionParam{
 					OfJSONSchema: &responses.ResponseFormatTextJSONSchemaConfigParam{
@@ -638,79 +639,93 @@ func convertThinkingLevel(level genai.ThinkingLevel) shared.ReasoningEffort {
 }
 
 // convertToStrictFunctionParams converts various parameter types to a map
-// compliant with OpenAI strict mode. Strict mode requires every object to
-// have "properties" and "additionalProperties": false. A nil input produces
-// a valid empty object schema so parameterless tools are accepted.
+// compliant with OpenAI strict mode. A nil input produces a valid empty
+// object schema so parameterless tools are accepted. The input is deep-copied
+// via JSON round-trip to avoid mutating the caller's schema.
 func convertToStrictFunctionParams(params any) map[string]any {
 	if params == nil {
 		return map[string]any{
 			"type":                 "object",
 			"properties":          map[string]any{},
+			"required":            []any{},
 			"additionalProperties": false,
 		}
 	}
 
-	var m map[string]any
-
-	if dm, ok := params.(map[string]any); ok {
-		m = dm
-	} else {
-		jsonBytes, err := json.Marshal(params)
-		if err != nil {
-			return nil
-		}
-		if json.Unmarshal(jsonBytes, &m) != nil {
-			return nil
-		}
+	m := deepCopySchema(params)
+	if m == nil {
+		return nil
 	}
 
 	lowercaseTypes(m)
-	ensureStrictObjectSchema(m)
+	normalizeStrictSchema(m)
 	return m
 }
 
-// ensureStrictObjectSchema recursively makes a JSON schema compliant with
-// OpenAI strict mode. For every object type it:
+// normalizeStrictSchema recursively makes a JSON schema compliant with
+// OpenAI strict mode. For every object type (whether type is "object" or
+// contains "object" in an array like ["object", "null"]) it:
 //   - adds "additionalProperties": false
 //   - ensures "properties" exists
 //   - sets "required" to all property keys
 //   - expands originally-optional properties to nullable (["type", "null"])
-func ensureStrictObjectSchema(schema map[string]any) {
+//
+// Child schemas are normalised before the parent marks optional fields as
+// nullable, so nested objects get their own required/additionalProperties
+// regardless of whether the parent considers them optional.
+func normalizeStrictSchema(schema map[string]any) {
 	if schema == nil {
 		return
 	}
 
-	if t, ok := schema["type"].(string); ok && t == "object" {
-		if _, hasProps := schema["properties"]; !hasProps {
-			schema["properties"] = map[string]any{}
-		}
-		schema["additionalProperties"] = false
-
-		props, _ := schema["properties"].(map[string]any)
-		if len(props) > 0 {
-			existing := toStringSet(schema["required"])
-			var allKeys []any
-			for key := range props {
-				allKeys = append(allKeys, key)
-				if !existing[key] {
-					makeNullable(props[key])
-				}
-			}
-			schema["required"] = allKeys
-		}
-	}
-
+	// Recurse into children first so nested objects are fully normalised
+	// before we decide which parent-level fields are optional.
 	if props, ok := schema["properties"].(map[string]any); ok {
 		for _, prop := range props {
 			if propMap, ok := prop.(map[string]any); ok {
-				ensureStrictObjectSchema(propMap)
+				normalizeStrictSchema(propMap)
 			}
 		}
 	}
-
 	if items, ok := schema["items"].(map[string]any); ok {
-		ensureStrictObjectSchema(items)
+		normalizeStrictSchema(items)
 	}
+
+	if !isObjectType(schema) {
+		return
+	}
+
+	if _, hasProps := schema["properties"]; !hasProps {
+		schema["properties"] = map[string]any{}
+	}
+	schema["additionalProperties"] = false
+
+	props, _ := schema["properties"].(map[string]any)
+	existing := toStringSet(schema["required"])
+	var allKeys []any
+	for key := range props {
+		allKeys = append(allKeys, key)
+		if !existing[key] {
+			makeNullable(props[key])
+		}
+	}
+	schema["required"] = allKeys
+}
+
+// isObjectType returns true if the schema's "type" is "object", either as a
+// plain string or inside an array (e.g. ["object", "null"]).
+func isObjectType(schema map[string]any) bool {
+	switch t := schema["type"].(type) {
+	case string:
+		return t == "object"
+	case []any:
+		for _, v := range t {
+			if s, ok := v.(string); ok && s == "object" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // makeNullable expands a property's type to ["<original>", "null"] so strict
@@ -749,6 +764,20 @@ func toStringSet(v any) map[string]bool {
 		}
 	}
 	return set
+}
+
+// deepCopySchema converts any schema representation into a fresh
+// map[string]any via JSON round-trip, avoiding mutation of the caller's data.
+func deepCopySchema(params any) map[string]any {
+	jsonBytes, err := json.Marshal(params)
+	if err != nil {
+		return nil
+	}
+	var m map[string]any
+	if json.Unmarshal(jsonBytes, &m) != nil {
+		return nil
+	}
+	return m
 }
 
 // lowercaseTypes recursively lowercases all "type" fields in a JSON schema map.
