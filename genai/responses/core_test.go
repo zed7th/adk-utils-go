@@ -117,7 +117,41 @@ func TestConvertToFunctionParams(t *testing.T) {
 			want: map[string]any{
 				"type":                 "object",
 				"properties":          map[string]any{},
+				"required":            []any{},
 				"additionalProperties": false,
+			},
+		},
+		{
+			name: "optional nested object gets strict treatment too",
+			in: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string"},
+					"opts": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"color": map[string]any{"type": "string"},
+						},
+						"required": []any{"color"},
+					},
+				},
+				"required": []any{"name"},
+			},
+			want: map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"required":            []any{"name", "opts"},
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string"},
+					"opts": map[string]any{
+						"type":                 []any{"object", "null"},
+						"additionalProperties": false,
+						"required":            []any{"color"},
+						"properties": map[string]any{
+							"color": map[string]any{"type": "string"},
+						},
+					},
+				},
 			},
 		},
 	}
@@ -154,6 +188,26 @@ func sortRequiredFields(schema map[string]any) {
 	}
 	if items, ok := schema["items"].(map[string]any); ok {
 		sortRequiredFields(items)
+	}
+}
+
+// convertToStrictFunctionParams must deep-copy the input so callers who
+// reuse schemas across multiple tool registrations don't see mutations.
+func TestConvertToStrictFunctionParams_DeepCopy(t *testing.T) {
+	original := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"a": map[string]any{"type": "string"}},
+	}
+
+	_ = convertToStrictFunctionParams(original)
+
+	// The original must still have a plain string type, not ["string","null"]
+	prop := original["properties"].(map[string]any)["a"].(map[string]any)
+	if _, ok := prop["type"].(string); !ok {
+		t.Errorf("original schema was mutated: a.type = %#v, want string", prop["type"])
+	}
+	if _, has := original["additionalProperties"]; has {
+		t.Errorf("original schema was mutated: has additionalProperties")
 	}
 }
 
