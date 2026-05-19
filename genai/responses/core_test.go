@@ -9,7 +9,9 @@
 package responses
 
 import (
+	"fmt"
 	"reflect"
+	"sort"
 	"testing"
 
 	"google.golang.org/genai"
@@ -90,30 +92,22 @@ func TestConvertToFunctionParams(t *testing.T) {
 		want map[string]any
 	}{
 		{
-			name: "uppercase types get normalised and properties injected",
+			name: "required auto-filled and optional fields made nullable",
 			in: map[string]any{
-				"type": "OBJECT",
+				"type": "object",
 				"properties": map[string]any{
-					"name": map[string]any{"type": "STRING"},
-					"items": map[string]any{
-						"type":  "ARRAY",
-						"items": map[string]any{"type": "OBJECT"},
-					},
+					"prompt":      map[string]any{"type": "string"},
+					"heightRatio": map[string]any{"type": "integer"},
 				},
+				"required": []any{"prompt"},
 			},
 			want: map[string]any{
 				"type":                 "object",
 				"additionalProperties": false,
+				"required":            []any{"prompt", "heightRatio"},
 				"properties": map[string]any{
-					"name": map[string]any{"type": "string"},
-					"items": map[string]any{
-						"type": "array",
-						"items": map[string]any{
-							"type":                 "object",
-							"properties":          map[string]any{},
-							"additionalProperties": false,
-						},
-					},
+					"prompt":      map[string]any{"type": "string"},
+					"heightRatio": map[string]any{"type": []any{"integer", "null"}},
 				},
 			},
 		},
@@ -131,10 +125,35 @@ func TestConvertToFunctionParams(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := convertToStrictFunctionParams(c.in)
+			sortRequiredFields(got)
+			sortRequiredFields(c.want)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("convertToStrictFunctionParams() = %#v\nwant %#v", got, c.want)
 			}
 		})
+	}
+}
+
+// sortRequiredFields normalises the "required" array order so map iteration
+// non-determinism does not cause test flakes.
+func sortRequiredFields(schema map[string]any) {
+	if schema == nil {
+		return
+	}
+	if req, ok := schema["required"].([]any); ok {
+		sort.Slice(req, func(i, j int) bool {
+			return fmt.Sprint(req[i]) < fmt.Sprint(req[j])
+		})
+	}
+	if props, ok := schema["properties"].(map[string]any); ok {
+		for _, v := range props {
+			if m, ok := v.(map[string]any); ok {
+				sortRequiredFields(m)
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]any); ok {
+		sortRequiredFields(items)
 	}
 }
 
