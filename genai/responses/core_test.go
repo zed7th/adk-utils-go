@@ -102,37 +102,37 @@ func TestConvertToFunctionParams(t *testing.T) {
 				},
 			},
 			want: map[string]any{
-				"type": "object",
+				"type":                 "object",
+				"additionalProperties": false,
 				"properties": map[string]any{
 					"name": map[string]any{"type": "string"},
 					"items": map[string]any{
 						"type": "array",
 						"items": map[string]any{
-							"type":       "object",
-							"properties": map[string]any{},
+							"type":                 "object",
+							"properties":          map[string]any{},
+							"additionalProperties": false,
 						},
 					},
 				},
 			},
 		},
 		{
-			name: "nil input returns nil",
+			name: "nil input returns valid empty object schema",
 			in:   nil,
-			want: nil,
+			want: map[string]any{
+				"type":                 "object",
+				"properties":          map[string]any{},
+				"additionalProperties": false,
+			},
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := convertToFunctionParams(c.in)
-			if c.want == nil {
-				if got != nil {
-					t.Errorf("convertToFunctionParams() = %#v, want nil", got)
-				}
-				return
-			}
+			got := convertToStrictFunctionParams(c.in)
 			if !reflect.DeepEqual(got, c.want) {
-				t.Errorf("convertToFunctionParams() = %#v\nwant %#v", got, c.want)
+				t.Errorf("convertToStrictFunctionParams() = %#v\nwant %#v", got, c.want)
 			}
 		})
 	}

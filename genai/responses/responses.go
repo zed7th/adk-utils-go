@@ -180,14 +180,32 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 					return
 				}
 
-			case "response.completed":
+			case "response.completed", "response.incomplete":
 				resp := &event.Response
 				llmResp, err := convertResponse(resp)
 				if err != nil {
-					yield(nil, err)
-					return
+					// Incomplete with no output → return empty response with
+					// the correct finish reason instead of an opaque error.
+					llmResp = &model.LLMResponse{
+						Content:      &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{}},
+						UsageMetadata: convertUsageMetadata(resp.Usage),
+						FinishReason: convertStatus(resp.Status, resp.IncompleteDetails),
+						TurnComplete: true,
+					}
 				}
 				yield(llmResp, nil)
+				return
+
+			case "response.failed":
+				errMsg := event.Response.Error.Message
+				if errMsg == "" {
+					errMsg = "response generation failed"
+				}
+				yield(nil, fmt.Errorf("openai responses api: %s", errMsg))
+				return
+
+			case "error":
+				yield(nil, fmt.Errorf("openai responses api stream error: %s", event.Message))
 				return
 			}
 		}
@@ -320,7 +338,7 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 	var items []responses.ResponseInputItemUnionParam
 	var textParts []string
 	var mediaParts []responses.ResponseInputContentUnionParam
-	var phase string
+	var phase, messageID string
 	role := convertRole(content.Role)
 
 	flushMessage := func() {
@@ -328,7 +346,8 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 			return
 		}
 
-		// Model output with phase metadata → use OutputMessage to preserve phase
+		// Model output with phase metadata → build OutputMessage manually to
+		// preserve phase and message ID for GPT-5.3-Codex+ round-tripping.
 		if role == responses.EasyInputMessageRoleAssistant && phase != "" {
 			var contentParts []responses.ResponseOutputMessageContentUnionParam
 			for _, t := range textParts {
@@ -336,9 +355,15 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 					OfOutputText: &responses.ResponseOutputTextParam{Text: t},
 				})
 			}
-			items = append(items, responses.ResponseInputItemParamOfOutputMessage(
-				contentParts, "", responses.ResponseOutputMessageStatusCompleted,
-			))
+			msg := responses.ResponseOutputMessageParam{
+				ID:      messageID,
+				Content: contentParts,
+				Status:  responses.ResponseOutputMessageStatusCompleted,
+				Phase:   responses.ResponseOutputMessagePhase(phase),
+			}
+			items = append(items, responses.ResponseInputItemUnionParam{
+				OfOutputMessage: &msg,
+			})
 		} else if len(mediaParts) == 0 {
 			items = append(items, responses.ResponseInputItemParamOfMessage(
 				joinTexts(textParts), role,
@@ -357,6 +382,7 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 		textParts = nil
 		mediaParts = nil
 		phase = ""
+		messageID = ""
 	}
 
 	for _, part := range content.Parts {
@@ -381,10 +407,32 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 				string(argsJSON), part.FunctionCall.ID, part.FunctionCall.Name,
 			))
 
+		case part.Thought && part.Text != "":
+			flushMessage()
+			summary := []responses.ResponseReasoningItemSummaryParam{
+				{Text: part.Text},
+			}
+			id := ""
+			if part.PartMetadata != nil {
+				if rid, ok := part.PartMetadata["reasoning_id"].(string); ok {
+					id = rid
+				}
+			}
+			item := responses.ResponseInputItemParamOfReasoning(id, summary)
+			if part.PartMetadata != nil {
+				if ec, ok := part.PartMetadata["encrypted_content"].(string); ok && ec != "" {
+					item.OfReasoning.EncryptedContent = param.NewOpt(ec)
+				}
+			}
+			items = append(items, item)
+
 		case part.Text != "":
 			if part.PartMetadata != nil {
 				if p, ok := part.PartMetadata["phase"].(string); ok && p != "" {
 					phase = p
+				}
+				if mid, ok := part.PartMetadata["message_id"].(string); ok && mid != "" {
+					messageID = mid
 				}
 			}
 			textParts = append(textParts, part.Text)
@@ -418,9 +466,13 @@ func convertResponse(resp *responses.Response) (*model.LLMResponse, error) {
 		case "reasoning":
 			for _, summary := range item.Summary {
 				if summary.Text != "" {
-					content.Parts = append(content.Parts, &genai.Part{
-						Text: summary.Text, Thought: true,
-					})
+					part := &genai.Part{Text: summary.Text, Thought: true}
+					meta := map[string]any{"reasoning_id": item.ID}
+					if item.EncryptedContent != "" {
+						meta["encrypted_content"] = item.EncryptedContent
+					}
+					part.PartMetadata = meta
+					content.Parts = append(content.Parts, part)
 				}
 			}
 
@@ -429,8 +481,15 @@ func convertResponse(resp *responses.Response) (*model.LLMResponse, error) {
 				switch cp.Type {
 				case "output_text":
 					part := &genai.Part{Text: cp.Text}
-					if item.Phase != "" {
-						part.PartMetadata = map[string]any{"phase": string(item.Phase)}
+					if item.Phase != "" || item.ID != "" {
+						meta := map[string]any{}
+						if item.Phase != "" {
+							meta["phase"] = string(item.Phase)
+						}
+						if item.ID != "" {
+							meta["message_id"] = item.ID
+						}
+						part.PartMetadata = meta
 					}
 					content.Parts = append(content.Parts, part)
 				case "refusal":
@@ -476,7 +535,7 @@ func convertTools(genaiTools []*genai.Tool) ([]responses.ToolUnionParam, error) 
 				OfFunction: &responses.FunctionToolParam{
 					Name:        funcDecl.Name,
 					Description: param.NewOpt(funcDecl.Description),
-					Parameters:  convertToFunctionParams(params),
+					Parameters:  convertToStrictFunctionParams(params),
 					Strict:      param.NewOpt(true),
 				},
 			})
@@ -578,11 +637,17 @@ func convertThinkingLevel(level genai.ThinkingLevel) shared.ReasoningEffort {
 	}
 }
 
-// convertToFunctionParams converts various parameter types to a map for the Responses API.
-// Ensures object schemas have a "properties" field and all types are lowercase.
-func convertToFunctionParams(params any) map[string]any {
+// convertToStrictFunctionParams converts various parameter types to a map
+// compliant with OpenAI strict mode. Strict mode requires every object to
+// have "properties" and "additionalProperties": false. A nil input produces
+// a valid empty object schema so parameterless tools are accepted.
+func convertToStrictFunctionParams(params any) map[string]any {
 	if params == nil {
-		return nil
+		return map[string]any{
+			"type":                 "object",
+			"properties":          map[string]any{},
+			"additionalProperties": false,
+		}
 	}
 
 	var m map[string]any
@@ -600,12 +665,14 @@ func convertToFunctionParams(params any) map[string]any {
 	}
 
 	lowercaseTypes(m)
-	ensureObjectProperties(m)
+	ensureStrictObjectSchema(m)
 	return m
 }
 
-// ensureObjectProperties recursively ensures all object schemas have a properties field.
-func ensureObjectProperties(schema map[string]any) {
+// ensureStrictObjectSchema recursively ensures all object schemas have a
+// "properties" field and "additionalProperties": false, as required by
+// OpenAI's strict mode for function tool parameters.
+func ensureStrictObjectSchema(schema map[string]any) {
 	if schema == nil {
 		return
 	}
@@ -614,18 +681,19 @@ func ensureObjectProperties(schema map[string]any) {
 		if _, hasProps := schema["properties"]; !hasProps {
 			schema["properties"] = map[string]any{}
 		}
+		schema["additionalProperties"] = false
 	}
 
 	if props, ok := schema["properties"].(map[string]any); ok {
 		for _, prop := range props {
 			if propMap, ok := prop.(map[string]any); ok {
-				ensureObjectProperties(propMap)
+				ensureStrictObjectSchema(propMap)
 			}
 		}
 	}
 
 	if items, ok := schema["items"].(map[string]any); ok {
-		ensureObjectProperties(items)
+		ensureStrictObjectSchema(items)
 	}
 }
 

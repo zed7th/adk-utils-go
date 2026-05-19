@@ -20,7 +20,7 @@
 //
 // Environment variables:
 //   OPENAI_API_KEY - OpenAI API key
-//   MODEL_NAME     - Model to use (default: gpt-4o)
+//   MODEL_NAME     - Model to use (default: gpt-5.5)
 
 package main
 
@@ -45,7 +45,7 @@ func main() {
 	// 1. Create the Responses API client
 	llmModel := genairesponses.New(genairesponses.Config{
 		APIKey:    os.Getenv("OPENAI_API_KEY"),
-		ModelName: getEnvOrDefault("MODEL_NAME", "gpt-4o"),
+		ModelName: getEnvOrDefault("MODEL_NAME", "gpt-5.5"),
 	})
 
 	// 2. Create an agent using the Responses API model
