@@ -691,8 +691,12 @@ func normalizeStrictSchema(schema map[string]any) {
 		normalizeStrictSchema(items)
 	}
 
-	if !isObjectType(schema) {
+	if !isObjectSchema(schema) {
 		return
+	}
+
+	if _, ok := schema["type"]; !ok {
+		schema["type"] = "object"
 	}
 
 	if _, hasProps := schema["properties"]; !hasProps {
@@ -702,7 +706,7 @@ func normalizeStrictSchema(schema map[string]any) {
 
 	props, _ := schema["properties"].(map[string]any)
 	existing := toStringSet(schema["required"])
-	var allKeys []any
+	allKeys := make([]any, 0, len(props))
 	for key := range props {
 		allKeys = append(allKeys, key)
 		if !existing[key] {
@@ -710,6 +714,17 @@ func normalizeStrictSchema(schema map[string]any) {
 		}
 	}
 	schema["required"] = allKeys
+}
+
+// isObjectSchema returns true if the schema represents an object — either
+// by explicit type or by having a "properties" field (common in dynamically
+// registered tools that omit "type").
+func isObjectSchema(schema map[string]any) bool {
+	if isObjectType(schema) {
+		return true
+	}
+	_, hasProps := schema["properties"]
+	return hasProps
 }
 
 // isObjectType returns true if the schema's "type" is "object", either as a

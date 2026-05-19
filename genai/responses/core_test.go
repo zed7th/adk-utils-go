@@ -154,6 +154,23 @@ func TestConvertToFunctionParams(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "schema with properties and null required is treated as object",
+			in: map[string]any{
+				"properties": map[string]any{
+					"env": map[string]any{"type": "string"},
+				},
+				"required": nil,
+			},
+			want: map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"required":            []any{"env"},
+				"properties": map[string]any{
+					"env": map[string]any{"type": []any{"string", "null"}},
+				},
+			},
+		},
 	}
 
 	for _, c := range cases {
