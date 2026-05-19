@@ -202,6 +202,11 @@ func TestConvertResponse_WithReasoning(t *testing.T) {
 	if got.UsageMetadata == nil || got.UsageMetadata.ThoughtsTokenCount != 7 {
 		t.Errorf("ThoughtsTokenCount = %v, want 7", got.UsageMetadata)
 	}
+	// Reasoning parts must carry reasoning_id for stateless round-tripping
+	pm := got.Content.Parts[0].PartMetadata
+	if pm == nil || pm["reasoning_id"] != "rs-1" {
+		t.Errorf("PartMetadata = %v, want reasoning_id=rs-1", pm)
+	}
 }
 
 // Phase metadata on assistant messages must be preserved in PartMetadata
@@ -237,15 +242,18 @@ func TestConvertResponse_PhaseMetadata(t *testing.T) {
 	}
 	pm := got.Content.Parts[0].PartMetadata
 	if pm == nil {
-		t.Fatalf("PartMetadata is nil, want phase=commentary")
+		t.Fatalf("PartMetadata is nil, want phase and message_id")
 	}
 	if pm["phase"] != "commentary" {
 		t.Errorf("PartMetadata[\"phase\"] = %v, want commentary", pm["phase"])
 	}
+	if pm["message_id"] != "msg-1" {
+		t.Errorf("PartMetadata[\"message_id\"] = %v, want msg-1", pm["message_id"])
+	}
 }
 
-// Messages without a phase should not have PartMetadata set, avoiding
-// unnecessary overhead on every response part.
+// Messages without a phase still carry message_id in PartMetadata for
+// round-tripping, but must not have a "phase" key.
 func TestConvertResponse_NoPhase(t *testing.T) {
 	raw := []byte(`{
 		"id": "resp-6",
@@ -271,8 +279,14 @@ func TestConvertResponse_NoPhase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
-	if got.Content.Parts[0].PartMetadata != nil {
-		t.Errorf("PartMetadata = %v, want nil for messages without phase", got.Content.Parts[0].PartMetadata)
+	pm := got.Content.Parts[0].PartMetadata
+	if pm != nil {
+		if _, hasPhase := pm["phase"]; hasPhase {
+			t.Errorf("PartMetadata has phase key, want absent for messages without phase")
+		}
+		if pm["message_id"] != "msg-1" {
+			t.Errorf("message_id = %v, want msg-1", pm["message_id"])
+		}
 	}
 }
 

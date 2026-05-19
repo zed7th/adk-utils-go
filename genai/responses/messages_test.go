@@ -170,7 +170,7 @@ func TestConvertContentToInputItems_PhasePreserved(t *testing.T) {
 		Parts: []*genai.Part{
 			{
 				Text:         "thinking...",
-				PartMetadata: map[string]any{"phase": "commentary"},
+				PartMetadata: map[string]any{"phase": "commentary", "message_id": "msg-42"},
 			},
 		},
 	}
@@ -182,8 +182,48 @@ func TestConvertContentToInputItems_PhasePreserved(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("expected 1 item, got %d", len(items))
 	}
-	if items[0].OfOutputMessage == nil {
+	msg := items[0].OfOutputMessage
+	if msg == nil {
 		t.Fatalf("expected OutputMessage for phase-carrying content, got %+v", items[0])
+	}
+	if msg.Phase != "commentary" {
+		t.Errorf("Phase = %q, want commentary", msg.Phase)
+	}
+	if msg.ID != "msg-42" {
+		t.Errorf("ID = %q, want msg-42", msg.ID)
+	}
+}
+
+// Thought parts with reasoning metadata must be emitted as reasoning input
+// items (not plain text) to preserve reasoning context across turns.
+func TestConvertContentToInputItems_ReasoningRoundTrip(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text:         "Let me think.",
+				Thought:      true,
+				PartMetadata: map[string]any{"reasoning_id": "rs-1", "encrypted_content": "enc123"},
+			},
+			{Text: "The answer."},
+		},
+	}
+
+	items, err := convertContentToInputItems(content)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items (reasoning + message), got %d", len(items))
+	}
+	if items[0].OfReasoning == nil {
+		t.Fatalf("first item should be reasoning, got %+v", items[0])
+	}
+	if items[0].OfReasoning.ID != "rs-1" {
+		t.Errorf("reasoning ID = %q, want rs-1", items[0].OfReasoning.ID)
+	}
+	if items[1].OfMessage == nil {
+		t.Fatalf("second item should be message, got %+v", items[1])
 	}
 }
 
