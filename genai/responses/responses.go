@@ -669,9 +669,12 @@ func convertToStrictFunctionParams(params any) map[string]any {
 	return m
 }
 
-// ensureStrictObjectSchema recursively ensures all object schemas have a
-// "properties" field and "additionalProperties": false, as required by
-// OpenAI's strict mode for function tool parameters.
+// ensureStrictObjectSchema recursively makes a JSON schema compliant with
+// OpenAI strict mode. For every object type it:
+//   - adds "additionalProperties": false
+//   - ensures "properties" exists
+//   - sets "required" to all property keys
+//   - expands originally-optional properties to nullable (["type", "null"])
 func ensureStrictObjectSchema(schema map[string]any) {
 	if schema == nil {
 		return
@@ -682,6 +685,19 @@ func ensureStrictObjectSchema(schema map[string]any) {
 			schema["properties"] = map[string]any{}
 		}
 		schema["additionalProperties"] = false
+
+		props, _ := schema["properties"].(map[string]any)
+		if len(props) > 0 {
+			existing := toStringSet(schema["required"])
+			var allKeys []any
+			for key := range props {
+				allKeys = append(allKeys, key)
+				if !existing[key] {
+					makeNullable(props[key])
+				}
+			}
+			schema["required"] = allKeys
+		}
 	}
 
 	if props, ok := schema["properties"].(map[string]any); ok {
@@ -695,6 +711,44 @@ func ensureStrictObjectSchema(schema map[string]any) {
 	if items, ok := schema["items"].(map[string]any); ok {
 		ensureStrictObjectSchema(items)
 	}
+}
+
+// makeNullable expands a property's type to ["<original>", "null"] so strict
+// mode accepts it as an optional (nullable) field.
+func makeNullable(prop any) {
+	propMap, ok := prop.(map[string]any)
+	if !ok {
+		return
+	}
+	switch t := propMap["type"].(type) {
+	case string:
+		propMap["type"] = []any{t, "null"}
+	case []any:
+		for _, v := range t {
+			if v == "null" {
+				return
+			}
+		}
+		propMap["type"] = append(t, "null")
+	}
+}
+
+// toStringSet builds a set from a "required" field ([]string or []any).
+func toStringSet(v any) map[string]bool {
+	set := map[string]bool{}
+	switch r := v.(type) {
+	case []string:
+		for _, s := range r {
+			set[s] = true
+		}
+	case []any:
+		for _, item := range r {
+			if s, ok := item.(string); ok {
+				set[s] = true
+			}
+		}
+	}
+	return set
 }
 
 // lowercaseTypes recursively lowercases all "type" fields in a JSON schema map.
