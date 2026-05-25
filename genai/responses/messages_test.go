@@ -194,16 +194,16 @@ func TestConvertContentToInputItems_PhasePreserved(t *testing.T) {
 	}
 }
 
-// Thought parts with reasoning metadata must be emitted as reasoning input
-// items (not plain text) to preserve reasoning context across turns.
-func TestConvertContentToInputItems_ReasoningRoundTrip(t *testing.T) {
+// Thought parts (reasoning summaries) reference server-side IDs and must be
+// silently dropped to avoid "Item not found" errors in stateless flows.
+func TestConvertContentToInputItems_ThoughtPartsSkipped(t *testing.T) {
 	content := &genai.Content{
 		Role: "model",
 		Parts: []*genai.Part{
 			{
 				Text:         "Let me think.",
 				Thought:      true,
-				PartMetadata: map[string]any{"reasoning_id": "rs-1", "encrypted_content": "enc123"},
+				PartMetadata: map[string]any{"reasoning_id": "rs-1"},
 			},
 			{Text: "The answer."},
 		},
@@ -213,17 +213,11 @@ func TestConvertContentToInputItems_ReasoningRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
-	if len(items) != 2 {
-		t.Fatalf("expected 2 items (reasoning + message), got %d", len(items))
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item (thought skipped), got %d", len(items))
 	}
-	if items[0].OfReasoning == nil {
-		t.Fatalf("first item should be reasoning, got %+v", items[0])
-	}
-	if items[0].OfReasoning.ID != "rs-1" {
-		t.Errorf("reasoning ID = %q, want rs-1", items[0].OfReasoning.ID)
-	}
-	if items[1].OfMessage == nil {
-		t.Fatalf("second item should be message, got %+v", items[1])
+	if items[0].OfMessage == nil {
+		t.Fatalf("item should be message, got %+v", items[0])
 	}
 }
 

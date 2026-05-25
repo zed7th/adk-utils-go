@@ -408,24 +408,13 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 				string(argsJSON), part.FunctionCall.ID, part.FunctionCall.Name,
 			))
 
-		case part.Thought && part.Text != "":
-			flushMessage()
-			summary := []responses.ResponseReasoningItemSummaryParam{
-				{Text: part.Text},
-			}
-			id := ""
-			if part.PartMetadata != nil {
-				if rid, ok := part.PartMetadata["reasoning_id"].(string); ok {
-					id = rid
-				}
-			}
-			item := responses.ResponseInputItemParamOfReasoning(id, summary)
-			if part.PartMetadata != nil {
-				if ec, ok := part.PartMetadata["encrypted_content"].(string); ok && ec != "" {
-					item.OfReasoning.EncryptedContent = param.NewOpt(ec)
-				}
-			}
-			items = append(items, item)
+		case part.Thought:
+			// Reasoning summaries are informational for the client. They
+			// reference server-side IDs that only exist in the context of
+			// the originating response. Replaying them without
+			// previous_response_id causes a 400 "Item not found" error,
+			// so we skip them entirely.
+			continue
 
 		case part.Text != "":
 			if part.PartMetadata != nil {
