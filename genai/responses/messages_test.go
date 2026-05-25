@@ -170,7 +170,7 @@ func TestConvertContentToInputItems_PhasePreserved(t *testing.T) {
 		Parts: []*genai.Part{
 			{
 				Text:         "thinking...",
-				PartMetadata: map[string]any{"phase": "commentary", "message_id": "msg-42"},
+				PartMetadata: map[string]any{"phase": "commentary"},
 			},
 		},
 	}
@@ -188,9 +188,6 @@ func TestConvertContentToInputItems_PhasePreserved(t *testing.T) {
 	}
 	if msg.Phase != "commentary" {
 		t.Errorf("Phase = %q, want commentary", msg.Phase)
-	}
-	if msg.ID != "msg-42" {
-		t.Errorf("ID = %q, want msg-42", msg.ID)
 	}
 }
 

@@ -339,7 +339,7 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 	var items []responses.ResponseInputItemUnionParam
 	var textParts []string
 	var mediaParts []responses.ResponseInputContentUnionParam
-	var phase, messageID string
+	var phase string
 	role := convertRole(content.Role)
 
 	flushMessage := func() {
@@ -357,7 +357,6 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 				})
 			}
 			msg := responses.ResponseOutputMessageParam{
-				ID:      messageID,
 				Content: contentParts,
 				Status:  responses.ResponseOutputMessageStatusCompleted,
 				Phase:   responses.ResponseOutputMessagePhase(phase),
@@ -383,7 +382,6 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 		textParts = nil
 		mediaParts = nil
 		phase = ""
-		messageID = ""
 	}
 
 	for _, part := range content.Parts {
@@ -420,9 +418,6 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 			if part.PartMetadata != nil {
 				if p, ok := part.PartMetadata["phase"].(string); ok && p != "" {
 					phase = p
-				}
-				if mid, ok := part.PartMetadata["message_id"].(string); ok && mid != "" {
-					messageID = mid
 				}
 			}
 			textParts = append(textParts, part.Text)
