@@ -9,6 +9,7 @@
 package openai
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -176,6 +177,75 @@ func TestConvertContentToMessages(t *testing.T) {
 	}
 }
 
+// TestConvertContentToMessages_ReasoningContent verifies that a Thought part in
+// history is serialised back as the non-standard reasoning_content field rather
+// than folded into plain content. This is required for OpenAI-compatible models
+// like MiMo to avoid a 400 in multi-turn tool-call conversations.
+func TestConvertContentToMessages_ReasoningContent(t *testing.T) {
+	t.Run("thought part with tool call emits reasoning_content", func(t *testing.T) {
+		m := newModelForTest()
+		content := &genai.Content{
+			Role: "model",
+			Parts: []*genai.Part{
+				{Text: "Need fresh data — call the weather tool.", Thought: true},
+				{Text: "Looking up weather."},
+				{FunctionCall: &genai.FunctionCall{ID: "call_1", Name: "get_weather", Args: map[string]any{"city": "Beijing"}}},
+			},
+		}
+
+		msgs, err := m.convertContentToMessages(content)
+		if err != nil {
+			t.Fatalf("convertContentToMessages error: %v", err)
+		}
+		if len(msgs) != 1 || msgs[0].OfAssistant == nil {
+			t.Fatalf("expected 1 assistant message, got %#v", msgs)
+		}
+
+		raw, err := json.Marshal(msgs[0].OfAssistant)
+		if err != nil {
+			t.Fatalf("marshal assistant message: %v", err)
+		}
+
+		var decoded map[string]any
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got := decoded["reasoning_content"]; got != "Need fresh data — call the weather tool." {
+			t.Errorf("reasoning_content = %v, want the thought text", got)
+		}
+		if got := decoded["content"]; got != "Looking up weather." {
+			t.Errorf("content = %v, want plain text only (no reasoning)", got)
+		}
+		if _, ok := decoded["tool_calls"]; !ok {
+			t.Errorf("expected tool_calls to be present, got %s", raw)
+		}
+	})
+
+	t.Run("no thought part omits reasoning_content", func(t *testing.T) {
+		m := newModelForTest()
+		content := &genai.Content{
+			Role:  "model",
+			Parts: []*genai.Part{{Text: "plain answer"}},
+		}
+
+		msgs, err := m.convertContentToMessages(content)
+		if err != nil {
+			t.Fatalf("convertContentToMessages error: %v", err)
+		}
+		raw, err := json.Marshal(msgs[0].OfAssistant)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if _, ok := decoded["reasoning_content"]; ok {
+			t.Errorf("reasoning_content must be absent for a non-thinking turn, got %s", raw)
+		}
+	})
+}
+
 // convertContentToMessages must propagate function call IDs through the
 // normalisation layer so OpenAI sees a valid tool_call_id (≤40 chars). The
 // inverse mapping must be discoverable through denormalizeToolCallID, which
@@ -230,7 +300,7 @@ func TestBuildRoleMessage(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			m := newModelForTest()
 			toolCalls := make([]openai.ChatCompletionMessageToolCallUnionParam, c.toolCalls)
-			got := m.buildRoleMessage(c.role, c.texts, nil, toolCalls)
+			got := m.buildRoleMessage(c.role, c.texts, "", nil, toolCalls)
 
 			if c.wantKind == "" {
 				if got != nil {
@@ -255,22 +325,25 @@ func TestBuildRoleMessage(t *testing.T) {
 // and may refuse to dispatch a tool-only turn.
 func TestBuildAssistantMessage(t *testing.T) {
 	cases := []struct {
-		name      string
-		texts     []string
-		toolCalls int
-		wantText  string
-		wantTools int
+		name          string
+		texts         []string
+		reasoning     string
+		toolCalls     int
+		wantText      string
+		wantTools     int
+		wantReasoning string
 	}{
-		{"text only", []string{"hi"}, 0, "hi", 0},
-		{"tool calls only", nil, 2, "", 2},
-		{"text + tool calls", []string{"a", "b"}, 1, "a\nb", 1},
-		{"empty produces empty assistant", nil, 0, "", 0},
+		{"text only", []string{"hi"}, "", 0, "hi", 0, ""},
+		{"tool calls only", nil, "", 2, "", 2, ""},
+		{"text + tool calls", []string{"a", "b"}, "", 1, "a\nb", 1, ""},
+		{"empty produces empty assistant", nil, "", 0, "", 0, ""},
+		{"reasoning + tool calls", nil, "thinking...", 1, "", 1, "thinking..."},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			toolCalls := make([]openai.ChatCompletionMessageToolCallUnionParam, c.toolCalls)
-			got := buildAssistantMessage(c.texts, toolCalls)
+			got := buildAssistantMessage(c.texts, c.reasoning, toolCalls)
 			if got == nil {
 				t.Fatalf("buildAssistantMessage returned nil")
 			}
@@ -283,6 +356,22 @@ func TestBuildAssistantMessage(t *testing.T) {
 			}
 			if len(a.ToolCalls) != c.wantTools {
 				t.Errorf("tool calls = %d, want %d", len(a.ToolCalls), c.wantTools)
+			}
+
+			raw, err := json.Marshal(a)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if c.wantReasoning == "" {
+				if _, ok := decoded["reasoning_content"]; ok {
+					t.Errorf("reasoning_content must be absent, got %s", raw)
+				}
+			} else if got := decoded["reasoning_content"]; got != c.wantReasoning {
+				t.Errorf("reasoning_content = %v, want %q", got, c.wantReasoning)
 			}
 		})
 	}
