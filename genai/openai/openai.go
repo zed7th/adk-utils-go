@@ -392,6 +392,7 @@ func (m *Model) applyGenerationConfig(params *openai.ChatCompletionNewParams, cf
 func (m *Model) convertContentToMessages(content *genai.Content) ([]openai.ChatCompletionMessageParamUnion, error) {
 	var messages []openai.ChatCompletionMessageParamUnion
 	var textParts []string
+	var reasoningParts []string
 	var toolCalls []openai.ChatCompletionMessageToolCallUnionParam
 	var mediaParts []openai.ChatCompletionContentPartUnionParam
 
@@ -421,6 +422,14 @@ func (m *Model) convertContentToMessages(content *genai.Content) ([]openai.ChatC
 				},
 			})
 
+		// convertContentToMessages: a Thought part (decoded from reasoning_content
+		// on the response side) must be sent back as reasoning_content rather than
+		// folded into plain content. Otherwise models like MiMo return 400 in
+		// multi-turn tool-call conversations when the historical reasoning_content
+		// is missing.
+		case part.Text != "" && part.Thought:
+			reasoningParts = append(reasoningParts, part.Text)
+
 		case part.Text != "":
 			textParts = append(textParts, part.Text)
 
@@ -433,8 +442,8 @@ func (m *Model) convertContentToMessages(content *genai.Content) ([]openai.ChatC
 		}
 	}
 
-	if len(textParts) > 0 || len(mediaParts) > 0 || len(toolCalls) > 0 {
-		msg := m.buildRoleMessage(content.Role, textParts, mediaParts, toolCalls)
+	if len(textParts) > 0 || len(reasoningParts) > 0 || len(mediaParts) > 0 || len(toolCalls) > 0 {
+		msg := m.buildRoleMessage(content.Role, textParts, joinTexts(reasoningParts), mediaParts, toolCalls)
 		if msg != nil {
 			messages = append(messages, *msg)
 		}
@@ -444,12 +453,12 @@ func (m *Model) convertContentToMessages(content *genai.Content) ([]openai.ChatC
 }
 
 // buildRoleMessage creates the appropriate message type based on role.
-func (m *Model) buildRoleMessage(role string, texts []string, media []openai.ChatCompletionContentPartUnionParam, toolCalls []openai.ChatCompletionMessageToolCallUnionParam) *openai.ChatCompletionMessageParamUnion {
+func (m *Model) buildRoleMessage(role string, texts []string, reasoning string, media []openai.ChatCompletionContentPartUnionParam, toolCalls []openai.ChatCompletionMessageToolCallUnionParam) *openai.ChatCompletionMessageParamUnion {
 	switch convertRole(role) {
 	case "user":
 		return buildUserMessage(texts, media)
 	case "assistant":
-		return buildAssistantMessage(texts, toolCalls)
+		return buildAssistantMessage(texts, reasoning, toolCalls)
 	case "system":
 		msg := openai.SystemMessage(joinTexts(texts))
 		return &msg
@@ -482,7 +491,13 @@ func buildUserMessage(texts []string, media []openai.ChatCompletionContentPartUn
 }
 
 // buildAssistantMessage creates an assistant message with optional tool calls.
-func buildAssistantMessage(texts []string, toolCalls []openai.ChatCompletionMessageToolCallUnionParam) *openai.ChatCompletionMessageParamUnion {
+//
+// When reasoning is non-empty, the non-standard "reasoning_content" field is
+// injected via SetExtraFields. openai-go provides no typed field for it (it
+// only exists in OpenAI-compatible providers' protocol extensions), so
+// ExtraFields is the only path. Models like MiMo require this field to be
+// fully echoed back across multi-turn tool-call history.
+func buildAssistantMessage(texts []string, reasoning string, toolCalls []openai.ChatCompletionMessageToolCallUnionParam) *openai.ChatCompletionMessageParamUnion {
 	msg := openai.ChatCompletionAssistantMessageParam{}
 
 	if len(texts) > 0 {
@@ -492,6 +507,9 @@ func buildAssistantMessage(texts []string, toolCalls []openai.ChatCompletionMess
 	}
 	if len(toolCalls) > 0 {
 		msg.ToolCalls = toolCalls
+	}
+	if reasoning != "" {
+		msg.SetExtraFields(map[string]any{"reasoning_content": reasoning})
 	}
 
 	return &openai.ChatCompletionMessageParamUnion{OfAssistant: &msg}
