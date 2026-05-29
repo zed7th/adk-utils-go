@@ -134,6 +134,15 @@ func (m *Model) generate(ctx context.Context, req *model.LLMRequest) iter.Seq2[*
 
 // generateStream sends a streaming request and yields partial responses
 // as they arrive, followed by a final aggregated response.
+//
+// Streamed deltas (Partial=true) are display-only; ADK persists only the final
+// non-partial event. The stream must therefore always end with a complete
+// aggregated event. Some OpenAI-compatible gateways omit the aggregated output
+// from response.completed, or close the connection without any terminal event
+// at all. Relying solely on the server-provided output then yields an empty
+// final event, so the assistant turn is lost from history on reload even though
+// it streamed fine. To stay robust, the deltas are accumulated locally as a
+// fallback, mirroring the Chat Completions adapter.
 func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
 		params, err := m.buildResponseParams(req)
@@ -144,6 +153,7 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 
 		stream := m.client.Responses.NewStreaming(ctx, params)
 
+		var acc streamAccumulator
 		for stream.Next() {
 			event := stream.Current()
 
@@ -152,6 +162,7 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 				if event.Delta == "" {
 					continue
 				}
+				acc.text.WriteString(event.Delta)
 				llmResp := &model.LLMResponse{
 					Content: &genai.Content{
 						Role:  genai.RoleModel,
@@ -168,6 +179,7 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 				if event.Delta == "" {
 					continue
 				}
+				acc.reasoning.WriteString(event.Delta)
 				llmResp := &model.LLMResponse{
 					Content: &genai.Content{
 						Role:  genai.RoleModel,
@@ -183,15 +195,14 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 			case "response.completed", "response.incomplete":
 				resp := &event.Response
 				llmResp, err := convertResponse(resp)
-				if err != nil {
-					// Incomplete with no output → return empty response with
-					// the correct finish reason instead of an opaque error.
-					llmResp = &model.LLMResponse{
-						Content:      &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{}},
-						UsageMetadata: convertUsageMetadata(resp.Usage),
-						FinishReason: convertStatus(resp.Status, resp.IncompleteDetails),
-						TurnComplete: true,
-					}
+				if err != nil || hasNoContent(llmResp) {
+					// The terminal event carried no aggregated output: rebuild the
+					// final response from the accumulated deltas, otherwise ADK
+					// would persist an empty event and the turn would be lost.
+					llmResp = acc.finalResponse(
+						convertStatus(resp.Status, resp.IncompleteDetails),
+						convertUsageMetadata(resp.Usage),
+					)
 				}
 				yield(llmResp, nil)
 				return
@@ -214,7 +225,58 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 			yield(nil, err)
 			return
 		}
+
+		// The stream ended without any terminal event (some gateways just close
+		// the connection after the last delta). Synthesize the final event from
+		// the accumulated deltas so the turn is persisted and ADK does not raise
+		// "last event is not final".
+		if acc.hasContent() {
+			yield(acc.finalResponse(genai.FinishReasonStop, nil), nil)
+		}
 	}
+}
+
+// streamAccumulator collects streamed delta text so a complete final response
+// can be rebuilt when the terminal event lacks the aggregated output. reasoning
+// holds the reasoning summary; text holds the final answer.
+type streamAccumulator struct {
+	reasoning strings.Builder
+	text      strings.Builder
+}
+
+// hasContent reports whether anything was accumulated that could be used to
+// rebuild a final response.
+func (a *streamAccumulator) hasContent() bool {
+	return a.reasoning.Len() > 0 || a.text.Len() > 0
+}
+
+// finalResponse builds a non-partial final response from the accumulated deltas
+// (for ADK to persist). The reasoning part precedes the answer part, matching
+// the temporal order in which they were streamed.
+func (a *streamAccumulator) finalResponse(
+	finishReason genai.FinishReason,
+	usage *genai.GenerateContentResponseUsageMetadata,
+) *model.LLMResponse {
+	content := &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{}}
+	if a.reasoning.Len() > 0 {
+		content.Parts = append(content.Parts, &genai.Part{Text: a.reasoning.String(), Thought: true})
+	}
+	if a.text.Len() > 0 {
+		content.Parts = append(content.Parts, &genai.Part{Text: a.text.String()})
+	}
+	return &model.LLMResponse{
+		Content:       content,
+		UsageMetadata: usage,
+		FinishReason:  finishReason,
+		Partial:       false,
+		TurnComplete:  true,
+	}
+}
+
+// hasNoContent reports whether convertResponse produced no persistable content
+// parts, used to decide whether to fall back to the accumulated deltas.
+func hasNoContent(resp *model.LLMResponse) bool {
+	return resp == nil || resp.Content == nil || len(resp.Content.Parts) == 0
 }
 
 // buildResponseParams converts an LLMRequest into Responses API parameters.
