@@ -439,6 +439,13 @@ func (m *Model) convertContentToMessages(content *genai.Content) ([]openai.ChatC
 				return nil, err
 			}
 			mediaParts = append(mediaParts, *p)
+
+		case part.FileData != nil:
+			p, err := convertFileDataToPart(part.FileData)
+			if err != nil {
+				return nil, err
+			}
+			mediaParts = append(mediaParts, *p)
 		}
 	}
 
@@ -785,6 +792,32 @@ func convertInlineDataToPart(data *genai.Blob) (*openai.ChatCompletionContentPar
 
 	default:
 		return nil, fmt.Errorf("unsupported inline data MIME type for OpenAI: %s", mediaType)
+	}
+}
+
+// convertFileDataToPart converts URL-referenced file data to an OpenAI content part.
+// Only images are supported: the Chat Completions API accepts a remote URL for
+// image_url, whereas audio and file inputs require the bytes to be uploaded first.
+// Returns an error for unsupported MIME types, mirroring convertInlineDataToPart so
+// unsupported content fails loudly instead of being dropped.
+func convertFileDataToPart(data *genai.FileData) (*openai.ChatCompletionContentPartUnionParam, error) {
+	if data == nil {
+		return nil, fmt.Errorf("file data is nil")
+	}
+
+	switch data.MIMEType {
+	case "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp":
+		return &openai.ChatCompletionContentPartUnionParam{
+			OfImageURL: &openai.ChatCompletionContentPartImageParam{
+				ImageURL: openai.ChatCompletionContentPartImageImageURLParam{
+					URL:    data.FileURI,
+					Detail: "auto",
+				},
+			},
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported file data MIME type for OpenAI: %s", data.MIMEType)
 	}
 }
 

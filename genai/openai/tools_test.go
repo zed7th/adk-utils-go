@@ -251,3 +251,53 @@ func TestConvertInlineDataToPart(t *testing.T) {
 		}
 	})
 }
+
+// convertFileDataToPart emits a remote-URL image part for the image MIME types
+// OpenAI supports. Unlike convertInlineDataToPart it passes the FileURI straight
+// through to image_url instead of base64-encoding bytes, and it rejects every
+// non-image MIME type because the Chat Completions API only accepts a URL for
+// images (audio and files still require uploaded bytes).
+func TestConvertFileDataToPart(t *testing.T) {
+	const fileURI = "https://cdn.example.com/cat.png"
+
+	cases := []struct {
+		name    string
+		mime    string
+		wantErr bool
+	}{
+		{name: "image/png becomes a url image part", mime: "image/png"},
+		{name: "image/jpeg also routes to image", mime: "image/jpeg"},
+		{name: "image/webp also routes to image", mime: "image/webp"},
+		{name: "audio is not supported via URL", mime: "audio/wav", wantErr: true},
+		{name: "pdf is not supported via URL", mime: "application/pdf", wantErr: true},
+		{name: "unsupported MIME type returns an error", mime: "video/mp4", wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := convertFileDataToPart(&genai.FileData{MIMEType: c.mime, FileURI: fileURI})
+			if c.wantErr {
+				if err == nil {
+					t.Errorf("expected error for MIME %q, got %#v", c.mime, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got == nil || got.OfImageURL == nil {
+				t.Fatalf("expected OfImageURL, got %#v", got)
+			}
+			if url := got.OfImageURL.ImageURL.URL; url != fileURI {
+				t.Errorf("URL = %q, want the raw file URI %q (must not be base64-encoded)", url, fileURI)
+			}
+		})
+	}
+
+	t.Run("nil file data returns an error", func(t *testing.T) {
+		_, err := convertFileDataToPart(nil)
+		if err == nil {
+			t.Errorf("expected error for nil file data")
+		}
+	})
+}
