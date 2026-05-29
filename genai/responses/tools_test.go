@@ -131,3 +131,46 @@ func TestConvertInlineDataToPart(t *testing.T) {
 		})
 	}
 }
+
+// convertFileDataToPart passes a remote image URL straight through to
+// ResponseInputImageParam. Only image MIME types are supported; everything else
+// (and a nil input) must return an error, because the Responses API only accepts
+// a URL for images while files require uploaded bytes.
+func TestConvertFileDataToPart(t *testing.T) {
+	const fileURI = "https://cdn.example.com/cat.png"
+
+	cases := []struct {
+		name     string
+		data     *genai.FileData
+		wantType string // "image", "error"
+	}{
+		{"png image", &genai.FileData{MIMEType: "image/png", FileURI: fileURI}, "image"},
+		{"jpeg image", &genai.FileData{MIMEType: "image/jpeg", FileURI: fileURI}, "image"},
+		{"webp image", &genai.FileData{MIMEType: "image/webp", FileURI: fileURI}, "image"},
+		{"pdf unsupported", &genai.FileData{MIMEType: "application/pdf", FileURI: fileURI}, "error"},
+		{"unsupported", &genai.FileData{MIMEType: "video/mp4", FileURI: fileURI}, "error"},
+		{"nil file data", nil, "error"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := convertFileDataToPart(c.data)
+
+			if c.wantType == "error" {
+				if err == nil {
+					t.Errorf("expected error, got %+v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.OfInputImage == nil {
+				t.Fatalf("expected OfInputImage, got %+v", got)
+			}
+			if url := got.OfInputImage.ImageURL.Value; url != fileURI {
+				t.Errorf("ImageURL = %q, want the raw file URI %q", url, fileURI)
+			}
+		})
+	}
+}

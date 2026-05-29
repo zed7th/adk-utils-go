@@ -490,6 +490,13 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 				return nil, err
 			}
 			mediaParts = append(mediaParts, *p)
+
+		case part.FileData != nil:
+			p, err := convertFileDataToPart(part.FileData)
+			if err != nil {
+				return nil, err
+			}
+			mediaParts = append(mediaParts, *p)
 		}
 	}
 
@@ -625,6 +632,29 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 
 	default:
 		return nil, fmt.Errorf("unsupported inline data MIME type for Responses API: %s", mediaType)
+	}
+}
+
+// convertFileDataToPart converts URL-referenced file data to a Responses API content part.
+// Only images are supported: the Responses API accepts a remote URL for input_image,
+// whereas file inputs require the bytes to be uploaded first.
+// Returns an error for unsupported MIME types, mirroring convertInlineDataToPart.
+func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputContentUnionParam, error) {
+	if data == nil {
+		return nil, fmt.Errorf("file data is nil")
+	}
+
+	switch data.MIMEType {
+	case "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp":
+		return &responses.ResponseInputContentUnionParam{
+			OfInputImage: &responses.ResponseInputImageParam{
+				ImageURL: param.NewOpt(data.FileURI),
+				Detail:   responses.ResponseInputImageDetailAuto,
+			},
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported file data MIME type for Responses API: %s", data.MIMEType)
 	}
 }
 

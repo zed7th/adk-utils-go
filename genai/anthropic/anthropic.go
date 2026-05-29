@@ -332,6 +332,14 @@ func (m *Model) convertContentToMessage(content *genai.Content) (*anthropic.Mess
 			blocks = append(blocks, *block)
 		}
 
+		if part.FileData != nil {
+			block, err := convertFileDataToBlock(part.FileData)
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, *block)
+		}
+
 		if part.FunctionCall != nil {
 			blocks = append(blocks, anthropic.ContentBlockParamUnion{
 				OfToolUse: &anthropic.ToolUseBlockParam{
@@ -706,6 +714,30 @@ func convertInlineDataToBlock(data *genai.Blob) (*anthropic.ContentBlockParamUni
 
 	default:
 		return nil, fmt.Errorf("unsupported inline data MIME type for Anthropic: %s", mediaType)
+	}
+}
+
+// convertFileDataToBlock converts URL-referenced file data to an Anthropic content block.
+// Only images are supported: Anthropic accepts a remote URL for an image source, whereas
+// other media types require the bytes to be uploaded first.
+// Returns an error for unsupported MIME types, mirroring convertInlineDataToBlock.
+func convertFileDataToBlock(data *genai.FileData) (*anthropic.ContentBlockParamUnion, error) {
+	if data == nil {
+		return nil, fmt.Errorf("file data is nil")
+	}
+
+	switch data.MIMEType {
+	case "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp":
+		return &anthropic.ContentBlockParamUnion{
+			OfImage: &anthropic.ImageBlockParam{
+				Source: anthropic.ImageBlockParamSourceUnion{
+					OfURL: &anthropic.URLImageSourceParam{URL: data.FileURI},
+				},
+			},
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported file data MIME type for Anthropic: %s", data.MIMEType)
 	}
 }
 

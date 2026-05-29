@@ -117,3 +117,58 @@ func TestConvertInlineDataToBlock(t *testing.T) {
 		}
 	})
 }
+
+// convertFileDataToBlock builds an OfImage block whose source is a remote URL
+// (OfURL) rather than base64 bytes, passing the FileURI through verbatim. Only
+// image MIME types are supported; PDFs, text, and unknown types are rejected,
+// since Anthropic only accepts a URL source for images.
+func TestConvertFileDataToBlock(t *testing.T) {
+	const fileURI = "https://cdn.example.com/cat.png"
+
+	cases := []struct {
+		name    string
+		mime    string
+		wantErr bool
+	}{
+		{name: "image/png", mime: "image/png"},
+		{name: "image/jpeg", mime: "image/jpeg"},
+		{name: "image/jpg alias", mime: "image/jpg"},
+		{name: "image/gif", mime: "image/gif"},
+		{name: "image/webp", mime: "image/webp"},
+		{name: "application/pdf unsupported", mime: "application/pdf", wantErr: true},
+		{name: "text/plain unsupported", mime: "text/plain", wantErr: true},
+		{name: "video/mp4 unsupported", mime: "video/mp4", wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := convertFileDataToBlock(&genai.FileData{MIMEType: c.mime, FileURI: fileURI})
+			if c.wantErr {
+				if err == nil {
+					t.Errorf("expected error for MIME %q, got %#v", c.mime, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got == nil || got.OfImage == nil {
+				t.Fatalf("expected OfImage variant, got %#v", got)
+			}
+			src := got.OfImage.Source.OfURL
+			if src == nil {
+				t.Fatalf("expected a URL image source, got %#v", got.OfImage.Source)
+			}
+			if src.URL != fileURI {
+				t.Errorf("URL = %q, want %q", src.URL, fileURI)
+			}
+		})
+	}
+
+	t.Run("nil file data returns an error", func(t *testing.T) {
+		_, err := convertFileDataToBlock(nil)
+		if err == nil {
+			t.Errorf("expected error for nil file data")
+		}
+	})
+}
