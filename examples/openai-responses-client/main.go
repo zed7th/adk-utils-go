@@ -15,8 +15,10 @@
 // OpenAI Responses API Client Example
 //
 // This example shows how to use the OpenAI Responses API client with ADK.
-// The Responses API is required for GPT-5.4+ models and provides native
-// support for reasoning items, phase metadata, and structured output.
+// The Responses API is OpenAI's recommended interface for new applications,
+// with native reasoning, built-in tools, and structured output. This adapter
+// runs it statelessly: ADK owns the conversation state and replays the full
+// history on each call.
 //
 // Environment variables:
 //   OPENAI_API_KEY - OpenAI API key

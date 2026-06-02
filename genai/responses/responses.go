@@ -12,12 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package responses provides an OpenAI Responses API implementation for the ADK.
-// It targets the /v1/responses endpoint, which is required for GPT-5.4+ models
-// and natively supports features like reasoning items, phase metadata, and
-// structured output that are unavailable through the Chat Completions API.
+// Package responses provides an OpenAI Responses API (/v1/responses)
+// implementation for the ADK.
 //
-// For OpenAI-compatible providers (Ollama, vLLM, DeepSeek, Kimi, etc.) that
+// The Responses API is the interface OpenAI recommends for new applications,
+// with native reasoning, built-in tools, and structured output.
+//
+// This adapter drives the API statelessly to match ADK's model: ADK owns the
+// conversation state and passes the full history on every call, so each request
+// replays that history as input items instead of chaining server-side state via
+// previous_response_id. Reasoning items reference server-side IDs from their
+// originating response, so they are surfaced to ADK but not replayed back.
+//
+// For OpenAI-compatible gateways (Ollama, vLLM, DeepSeek, Kimi, etc.) that only
 // expose the Chat Completions endpoint, use the genai/openai package instead.
 package responses
 
