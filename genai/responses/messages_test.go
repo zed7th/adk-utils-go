@@ -194,9 +194,10 @@ func TestConvertContentToInputItems_PhasePreserved(t *testing.T) {
 	}
 }
 
-// Thought parts (reasoning summaries) reference server-side IDs and must be
-// silently dropped to avoid "Item not found" errors in stateless flows.
-func TestConvertContentToInputItems_ThoughtPartsSkipped(t *testing.T) {
+// Thought parts without encrypted content reference server-side IDs that only
+// resolve in the originating response, so they must be silently dropped to
+// avoid "Item not found" errors in stateless flows.
+func TestConvertContentToInputItems_ThoughtPartsWithoutEncryptedContentSkipped(t *testing.T) {
 	content := &genai.Content{
 		Role: "model",
 		Parts: []*genai.Part{
@@ -218,6 +219,83 @@ func TestConvertContentToInputItems_ThoughtPartsSkipped(t *testing.T) {
 	}
 	if items[0].OfMessage == nil {
 		t.Fatalf("item should be message, got %+v", items[0])
+	}
+}
+
+// Thought parts carrying encrypted content must be replayed as reasoning
+// items, preceding the rest of the assistant turn: reasoning models require
+// the reasoning item that led to a function_call to be present in the input.
+func TestConvertContentToInputItems_ThoughtPartsWithEncryptedContentReplayed(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text:    "Let me think.",
+				Thought: true,
+				PartMetadata: map[string]any{
+					"reasoning_id":      "rs-1",
+					"encrypted_content": "enc-blob",
+				},
+			},
+			{FunctionCall: &genai.FunctionCall{ID: "call-1", Name: "get_weather"}},
+		},
+	}
+
+	items, err := convertContentToInputItems(content)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items (reasoning + function call), got %d", len(items))
+	}
+	reasoning := items[0].OfReasoning
+	if reasoning == nil {
+		t.Fatalf("first item should be a reasoning item, got %+v", items[0])
+	}
+	if reasoning.ID != "rs-1" {
+		t.Errorf("reasoning ID = %q, want rs-1", reasoning.ID)
+	}
+	if !reasoning.EncryptedContent.Valid() || reasoning.EncryptedContent.Value != "enc-blob" {
+		t.Errorf("EncryptedContent = %+v, want enc-blob", reasoning.EncryptedContent)
+	}
+	if len(reasoning.Summary) != 1 || reasoning.Summary[0].Text != "Let me think." {
+		t.Errorf("Summary = %+v, want single summary with original text", reasoning.Summary)
+	}
+	if items[1].OfFunctionCall == nil {
+		t.Fatalf("second item should be the function call, got %+v", items[1])
+	}
+}
+
+// A reasoning item with encrypted content but no summary text (common for
+// reasoning models) must still be replayed, with an empty summary list.
+func TestConvertContentToInputItems_EncryptedThoughtWithoutSummary(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Thought: true,
+				PartMetadata: map[string]any{
+					"reasoning_id":      "rs-2",
+					"encrypted_content": "enc-blob-2",
+				},
+			},
+			{Text: "The answer."},
+		},
+	}
+
+	items, err := convertContentToInputItems(content)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items (reasoning + message), got %d", len(items))
+	}
+	reasoning := items[0].OfReasoning
+	if reasoning == nil {
+		t.Fatalf("first item should be a reasoning item, got %+v", items[0])
+	}
+	if len(reasoning.Summary) != 0 {
+		t.Errorf("Summary = %+v, want empty", reasoning.Summary)
 	}
 }
 

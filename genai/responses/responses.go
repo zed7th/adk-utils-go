@@ -24,8 +24,13 @@
 // This adapter drives the API statelessly to match ADK's model: ADK owns the
 // conversation state and passes the full history on every call, so each request
 // replays that history as input items instead of chaining server-side state via
-// previous_response_id. Reasoning items reference server-side IDs from their
-// originating response, so they are surfaced to ADK but not replayed back.
+// previous_response_id. Requests are sent with store=false so nothing is
+// persisted server-side, and reasoning is requested with encrypted_content so
+// reasoning items can be replayed across turns: this keeps the model's chain
+// of thought available between tool calls, as reasoning models require.
+// Reasoning items without encrypted content (e.g. from gateways that do not
+// support the include parameter) are skipped on replay, since their bare IDs
+// only resolve in the context of the originating response.
 //
 // For OpenAI-compatible gateways (Ollama, vLLM, DeepSeek, Kimi, etc.) that only
 // expose the Chat Completions endpoint, use the genai/openai package instead.
@@ -39,6 +44,7 @@ import (
 	"fmt"
 	"iter"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/openai/openai-go/v3"
@@ -293,6 +299,14 @@ func hasNoContent(resp *model.LLMResponse) bool {
 func (m *Model) buildResponseParams(req *model.LLMRequest) (responses.ResponseNewParams, error) {
 	params := responses.ResponseNewParams{
 		Model: shared.ResponsesModel(m.modelName),
+		// ADK owns the conversation state, so nothing needs to be stored
+		// server-side. store=false also makes the API return encrypted
+		// reasoning content (requested via include below), which is the only
+		// way to replay reasoning items in a stateless flow.
+		Store: param.NewOpt(false),
+		Include: []responses.ResponseIncludable{
+			responses.ResponseIncludableReasoningEncryptedContent,
+		},
 	}
 
 	// System instruction → instructions field
@@ -479,12 +493,31 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 			))
 
 		case part.Thought:
-			// Reasoning summaries are informational for the client. They
-			// reference server-side IDs that only exist in the context of
-			// the originating response. Replaying them without
-			// previous_response_id causes a 400 "Item not found" error,
-			// so we skip them entirely.
-			continue
+			// Reasoning items carrying encrypted content are replayed so the
+			// model keeps its chain of thought across turns; reasoning models
+			// require the reasoning item preceding a function_call to be
+			// present in the input. Items without encrypted content (e.g.
+			// from gateways that ignore the include parameter) are skipped:
+			// their bare IDs only resolve in the context of the originating
+			// response and replaying them causes a 400 "Item not found".
+			enc, _ := part.PartMetadata["encrypted_content"].(string)
+			id, _ := part.PartMetadata["reasoning_id"].(string)
+			if enc == "" || id == "" {
+				continue
+			}
+			flushMessage()
+			reasoning := responses.ResponseReasoningItemParam{
+				ID:               id,
+				Summary:          []responses.ResponseReasoningItemSummaryParam{},
+				EncryptedContent: param.NewOpt(enc),
+			}
+			if part.Text != "" {
+				reasoning.Summary = append(reasoning.Summary,
+					responses.ResponseReasoningItemSummaryParam{Text: part.Text})
+			}
+			items = append(items, responses.ResponseInputItemUnionParam{
+				OfReasoning: &reasoning,
+			})
 
 		case part.Text != "":
 			if part.PartMetadata != nil {
@@ -528,17 +561,27 @@ func convertResponse(resp *responses.Response) (*model.LLMResponse, error) {
 	for _, item := range resp.Output {
 		switch item.Type {
 		case "reasoning":
+			// One part per reasoning item, even when the summary is empty:
+			// the encrypted content must survive the round-trip through ADK
+			// history so the item can be replayed on the next turn.
+			var summaryTexts []string
 			for _, summary := range item.Summary {
 				if summary.Text != "" {
-					part := &genai.Part{Text: summary.Text, Thought: true}
-					meta := map[string]any{"reasoning_id": item.ID}
-					if item.EncryptedContent != "" {
-						meta["encrypted_content"] = item.EncryptedContent
-					}
-					part.PartMetadata = meta
-					content.Parts = append(content.Parts, part)
+					summaryTexts = append(summaryTexts, summary.Text)
 				}
 			}
+			if len(summaryTexts) == 0 && item.EncryptedContent == "" {
+				continue
+			}
+			meta := map[string]any{"reasoning_id": item.ID}
+			if item.EncryptedContent != "" {
+				meta["encrypted_content"] = item.EncryptedContent
+			}
+			content.Parts = append(content.Parts, &genai.Part{
+				Text:         joinTexts(summaryTexts),
+				Thought:      true,
+				PartMetadata: meta,
+			})
 
 		case "message":
 			for _, cp := range item.Content {
@@ -799,6 +842,12 @@ func normalizeStrictSchema(schema map[string]any) {
 			makeNullable(props[key])
 		}
 	}
+	// Sort for a deterministic order: map iteration is randomised, and an
+	// unstable "required" array changes the serialized tool definition on
+	// every request, which breaks OpenAI prompt-cache prefix matching.
+	sort.Slice(allKeys, func(i, j int) bool {
+		return allKeys[i].(string) < allKeys[j].(string)
+	})
 	schema["required"] = allKeys
 }
 
