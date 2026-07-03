@@ -432,3 +432,24 @@ func TestConvertUsageMetadata(t *testing.T) {
 		}
 	})
 }
+
+// Conversion failures in the generation config must propagate out of
+// buildResponseParams instead of being swallowed, so callers see the broken
+// tool definition immediately.
+func TestBuildResponseParams_InvalidToolPropagates(t *testing.T) {
+	m := New(Config{APIKey: "test", ModelName: "gpt-5.5"})
+	req := &model.LLMRequest{
+		Config: &genai.GenerateContentConfig{
+			Tools: []*genai.Tool{{
+				FunctionDeclarations: []*genai.FunctionDeclaration{{
+					Name:                 "broken",
+					ParametersJsonSchema: make(chan int),
+				}},
+			}},
+		},
+	}
+
+	if _, err := m.buildResponseParams(req); err == nil {
+		t.Fatalf("buildResponseParams() error = nil, want tool conversion error")
+	}
+}

@@ -177,3 +177,19 @@ func TestConvertFileDataToPart(t *testing.T) {
 		})
 	}
 }
+
+// Tool parameters that cannot be serialized to JSON must fail loudly:
+// silently sending the request without the tool definition surfaces as
+// inexplicable model behaviour.
+func TestConvertTools_UnserializableParams(t *testing.T) {
+	tools := []*genai.Tool{{
+		FunctionDeclarations: []*genai.FunctionDeclaration{{
+			Name:                 "broken",
+			ParametersJsonSchema: make(chan int),
+		}},
+	}}
+
+	if _, err := convertTools(tools); err == nil {
+		t.Fatalf("convertTools() error = nil, want serialization error")
+	}
+}

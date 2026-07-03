@@ -244,6 +244,18 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 					return
 				}
 
+			case "response.output_item.done":
+				// Completed function calls are accumulated so the fallback
+				// final event includes them: losing a tool call would
+				// silently break the agent loop.
+				if event.Item.Type == "function_call" {
+					acc.functionCalls = append(acc.functionCalls, &genai.FunctionCall{
+						ID:   event.Item.CallID,
+						Name: event.Item.Name,
+						Args: parseJSONArgs(event.Item.Arguments.OfString),
+					})
+				}
+
 			case "response.completed", "response.incomplete":
 				resp := &event.Response
 				llmResp, err := convertResponse(resp, m.origin)
@@ -288,23 +300,25 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 	}
 }
 
-// streamAccumulator collects streamed delta text so a complete final response
-// can be rebuilt when the terminal event lacks the aggregated output. reasoning
-// holds the reasoning summary; text holds the final answer.
+// streamAccumulator collects streamed deltas so a complete final response
+// can be rebuilt when the terminal event lacks the aggregated output.
+// reasoning holds the reasoning summary; text holds the final answer;
+// functionCalls holds tool calls completed during the stream.
 type streamAccumulator struct {
-	reasoning strings.Builder
-	text      strings.Builder
+	reasoning     strings.Builder
+	text          strings.Builder
+	functionCalls []*genai.FunctionCall
 }
 
 // hasContent reports whether anything was accumulated that could be used to
 // rebuild a final response.
 func (a *streamAccumulator) hasContent() bool {
-	return a.reasoning.Len() > 0 || a.text.Len() > 0
+	return a.reasoning.Len() > 0 || a.text.Len() > 0 || len(a.functionCalls) > 0
 }
 
 // finalResponse builds a non-partial final response from the accumulated deltas
-// (for ADK to persist). The reasoning part precedes the answer part, matching
-// the temporal order in which they were streamed.
+// (for ADK to persist). The reasoning part precedes the answer part, which
+// precedes the tool calls, matching the temporal order in which they streamed.
 func (a *streamAccumulator) finalResponse(
 	finishReason genai.FinishReason,
 	usage *genai.GenerateContentResponseUsageMetadata,
@@ -315,6 +329,9 @@ func (a *streamAccumulator) finalResponse(
 	}
 	if a.text.Len() > 0 {
 		content.Parts = append(content.Parts, &genai.Part{Text: a.text.String()})
+	}
+	for _, fc := range a.functionCalls {
+		content.Parts = append(content.Parts, &genai.Part{FunctionCall: fc})
 	}
 	return &model.LLMResponse{
 		Content:       content,
@@ -367,14 +384,16 @@ func (m *Model) buildResponseParams(req *model.LLMRequest) (responses.ResponseNe
 
 	// Generation config
 	if req.Config != nil {
-		applyGenerationConfig(&params, req.Config)
+		if err := applyGenerationConfig(&params, req.Config); err != nil {
+			return responses.ResponseNewParams{}, err
+		}
 	}
 
 	return params, nil
 }
 
 // applyGenerationConfig applies optional generation settings to the request params.
-func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.GenerateContentConfig) {
+func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.GenerateContentConfig) error {
 	if cfg.Temperature != nil {
 		params.Temperature = param.NewOpt(float64(*cfg.Temperature))
 	}
@@ -402,28 +421,35 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 		}
 	}
 
-	// Structured output with schema (also strict-normalised)
+	// Structured output with schema (also strict-normalised). Conversion
+	// errors are returned rather than swallowed: silently dropping the
+	// schema or the tools would send the request anyway and surface as
+	// inexplicable model behaviour.
 	if cfg.ResponseSchema != nil {
-		if schemaMap, err := convertSchema(cfg.ResponseSchema); err == nil {
-			normalizeStrictSchema(schemaMap)
-			params.Text = responses.ResponseTextConfigParam{
-				Format: responses.ResponseFormatTextConfigUnionParam{
-					OfJSONSchema: &responses.ResponseFormatTextJSONSchemaConfigParam{
-						Name:        "response",
-						Description: param.NewOpt(cfg.ResponseSchema.Description),
-						Schema:      schemaMap,
-						Strict:      param.NewOpt(true),
-					},
+		schemaMap, err := convertSchema(cfg.ResponseSchema)
+		if err != nil {
+			return fmt.Errorf("failed to convert response schema: %w", err)
+		}
+		normalizeStrictSchema(schemaMap)
+		params.Text = responses.ResponseTextConfigParam{
+			Format: responses.ResponseFormatTextConfigUnionParam{
+				OfJSONSchema: &responses.ResponseFormatTextJSONSchemaConfigParam{
+					Name:        "response",
+					Description: param.NewOpt(cfg.ResponseSchema.Description),
+					Schema:      schemaMap,
+					Strict:      param.NewOpt(true),
 				},
-			}
+			},
 		}
 	}
 
 	// Tools
 	if len(cfg.Tools) > 0 {
-		if tools, err := convertTools(cfg.Tools); err == nil {
-			params.Tools = tools
+		tools, err := convertTools(cfg.Tools)
+		if err != nil {
+			return fmt.Errorf("failed to convert tools: %w", err)
 		}
+		params.Tools = tools
 	}
 
 	// ToolConfig → tool_choice
@@ -452,6 +478,8 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 			}
 		}
 	}
+
+	return nil
 }
 
 // convertContentToInputItems converts a genai.Content into Responses API input items.
@@ -487,7 +515,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 		}
 
 		// Model output with phase metadata → build OutputMessage manually to
-		// preserve phase and message ID for GPT-5.3-Codex+ round-tripping.
+		// preserve the phase field for GPT-5.3-Codex+ round-tripping.
 		if role == responses.EasyInputMessageRoleAssistant && phase != "" {
 			var contentParts []responses.ResponseOutputMessageContentUnionParam
 			for _, t := range textParts {
@@ -710,15 +738,23 @@ func convertTools(genaiTools []*genai.Tool) ([]responses.ToolUnionParam, error) 
 
 		for _, funcDecl := range genaiTool.FunctionDeclarations {
 			params := funcDecl.ParametersJsonSchema
-			if params == nil {
+			// Assign only a non-nil *genai.Schema: a nil pointer stored in
+			// the interface would defeat the nil check that gives
+			// parameterless tools a valid empty object schema.
+			if params == nil && funcDecl.Parameters != nil {
 				params = funcDecl.Parameters
+			}
+
+			strictParams := convertToStrictFunctionParams(params)
+			if strictParams == nil {
+				return nil, fmt.Errorf("parameters of tool %q cannot be converted to a JSON schema object", funcDecl.Name)
 			}
 
 			tools = append(tools, responses.ToolUnionParam{
 				OfFunction: &responses.FunctionToolParam{
 					Name:        funcDecl.Name,
 					Description: param.NewOpt(funcDecl.Description),
-					Parameters:  convertToStrictFunctionParams(params),
+					Parameters:  strictParams,
 					Strict:      param.NewOpt(true),
 				},
 			})
