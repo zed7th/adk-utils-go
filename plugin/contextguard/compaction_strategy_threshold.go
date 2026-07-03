@@ -1,16 +1,5 @@
-// Copyright 2025 achetronic
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
 
 package contextguard
 
@@ -18,8 +7,8 @@ import (
 	"log/slog"
 	"sync"
 
-	"google.golang.org/adk/agent"
-	"google.golang.org/adk/model"
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/model"
 )
 
 // thresholdStrategy implements token-based compaction. It estimates total
@@ -34,20 +23,20 @@ import (
 // Compaction always produces a full summary (no recent tail preserved),
 // matching Crush CLI behaviour. The result is [summary] + [continuation].
 type thresholdStrategy struct {
-	registry    ModelRegistry
-	llm         model.LLM
-	maxTokens   int
+	registry              ModelRegistry
+	llm                   model.LLM
+	maxTokens             int
 	maxCompactionAttempts int
-	mu          sync.Mutex
+	mu                    sync.Mutex
 }
 
 // newThresholdStrategy creates a threshold strategy. If maxTokens > 0 it
 // overrides the registry lookup for the context window size.
 func newThresholdStrategy(registry ModelRegistry, llm model.LLM, maxTokens int, maxCompactionAttempts int) *thresholdStrategy {
 	return &thresholdStrategy{
-		registry:    registry,
-		llm:         llm,
-		maxTokens:   maxTokens,
+		registry:              registry,
+		llm:                   llm,
+		maxTokens:             maxTokens,
 		maxCompactionAttempts: maxCompactionAttempts,
 	}
 }
@@ -62,7 +51,7 @@ func (s *thresholdStrategy) Name() string {
 // rewrites req.Contents to [summary] + [continuation instruction].
 //
 // Token source priority: calibrated heuristic > stale real tokens > raw heuristic.
-func (s *thresholdStrategy) Compact(ctx agent.CallbackContext, req *model.LLMRequest) error {
+func (s *thresholdStrategy) Compact(ctx agent.Context, req *model.LLMRequest) error {
 	var contextWindow int
 	if s.maxTokens > 0 {
 		contextWindow = s.maxTokens

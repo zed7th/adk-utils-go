@@ -1,10 +1,5 @@
-// Copyright 2025 achetronic
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
 
 package anthropic
 
@@ -186,6 +181,54 @@ func TestConvertResponse(t *testing.T) {
 	}
 	if got.Content.Parts[1].FunctionCall.Name != "my_tool" {
 		t.Errorf("Parts[1].FunctionCall.Name = %q, want %q", got.Content.Parts[1].FunctionCall.Name, "my_tool")
+	}
+}
+
+// TestConvertResponseCachedUsage pins the prompt-token accounting when
+// prompt caching is active: PromptTokenCount is input_tokens +
+// cache_read_input_tokens + cache_creation_input_tokens, with the
+// read-hit portion also surfaced in CachedContentTokenCount. The
+// cache-less case is pinned by TestConvertResponse above.
+func TestConvertResponseCachedUsage(t *testing.T) {
+	m := &Model{}
+
+	raw := []byte(`{
+		"id": "msg_1",
+		"role": "assistant",
+		"content": [{"type": "text", "text": "Hello"}],
+		"usage": {
+			"input_tokens": 2,
+			"output_tokens": 20,
+			"cache_read_input_tokens": 130000,
+			"cache_creation_input_tokens": 1000
+		},
+		"stop_reason": "end_turn"
+	}`)
+
+	var resp anthropic.Message
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("failed to unmarshal Anthropic message fixture: %v", err)
+	}
+
+	got, err := m.convertResponse(&resp)
+	if err != nil {
+		t.Fatalf("convertResponse error: %v", err)
+	}
+	if got.UsageMetadata == nil {
+		t.Fatalf("expected usage metadata to be populated")
+	}
+	if want := int32(2 + 130000 + 1000); got.UsageMetadata.PromptTokenCount != want {
+		t.Errorf("PromptTokenCount = %d, want %d (input + cache_read + cache_creation)",
+			got.UsageMetadata.PromptTokenCount, want)
+	}
+	if got.UsageMetadata.CachedContentTokenCount != 130000 {
+		t.Errorf("CachedContentTokenCount = %d, want 130000", got.UsageMetadata.CachedContentTokenCount)
+	}
+	if got.UsageMetadata.CandidatesTokenCount != 20 {
+		t.Errorf("CandidatesTokenCount = %d, want 20", got.UsageMetadata.CandidatesTokenCount)
+	}
+	if want := int32(131002 + 20); got.UsageMetadata.TotalTokenCount != want {
+		t.Errorf("TotalTokenCount = %d, want %d", got.UsageMetadata.TotalTokenCount, want)
 	}
 }
 

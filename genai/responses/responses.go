@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // Copyright 2025 achetronic
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,7 +46,7 @@ import (
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared"
-	"google.golang.org/adk/model"
+	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )
 
@@ -729,8 +732,8 @@ func convertToStrictFunctionParams(params any) map[string]any {
 	if params == nil {
 		return map[string]any{
 			"type":                 "object",
-			"properties":          map[string]any{},
-			"required":            []any{},
+			"properties":           map[string]any{},
+			"required":             []any{},
 			"additionalProperties": false,
 		}
 	}

@@ -1,16 +1,5 @@
-// Copyright 2025 achetronic
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
 
 // Package contextguard implements an ADK plugin that prevents conversations
 // from exceeding the LLM's context window. Before every model call it
@@ -45,11 +34,11 @@ package contextguard
 import (
 	"log/slog"
 
-	"google.golang.org/adk/agent"
-	"google.golang.org/adk/agent/llmagent"
-	"google.golang.org/adk/model"
-	"google.golang.org/adk/plugin"
-	"google.golang.org/adk/runner"
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/agent/llmagent"
+	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/plugin"
+	"google.golang.org/adk/v2/runner"
 )
 
 const (
@@ -100,16 +89,16 @@ const defaultMaxTurns = 20
 // compact conversation history before an LLM call.
 type Strategy interface {
 	Name() string
-	Compact(ctx agent.CallbackContext, req *model.LLMRequest) error
+	Compact(ctx agent.Context, req *model.LLMRequest) error
 }
 
 // AgentOption configures per-agent behavior when calling Add.
 type AgentOption func(*agentConfig)
 
 type agentConfig struct {
-	strategy    string
-	maxTurns    int
-	maxTokens   int
+	strategy              string
+	maxTurns              int
+	maxTokens             int
 	maxCompactionAttempts int
 }
 
@@ -215,7 +204,7 @@ type contextGuard struct {
 // After compaction (or pass-through), it persists the heuristic token
 // estimate of the final request so that the next call can compute a
 // calibration factor between real and heuristic counts.
-func (g *contextGuard) beforeModel(ctx agent.CallbackContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+func (g *contextGuard) beforeModel(ctx agent.Context, req *model.LLMRequest) (*model.LLMResponse, error) {
 	if req == nil || len(req.Contents) == 0 {
 		return nil, nil
 	}
@@ -246,7 +235,7 @@ func (g *contextGuard) beforeModel(ctx agent.CallbackContext, req *model.LLMRequ
 // that the LLM received, which is the value to compare against the context
 // window threshold. CandidatesTokenCount (the model's output) will become
 // part of the next turn's prompt automatically.
-func (g *contextGuard) afterModel(ctx agent.CallbackContext, resp *model.LLMResponse, _ error) (*model.LLMResponse, error) {
+func (g *contextGuard) afterModel(ctx agent.Context, resp *model.LLMResponse, _ error) (*model.LLMResponse, error) {
 	if resp == nil || resp.Partial {
 		return nil, nil
 	}

@@ -1,16 +1,5 @@
-// Copyright 2025 achetronic
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
 
 // Package openai provides an OpenAI-compatible LLM implementation for the ADK.
 // It supports both native OpenAI API and compatible providers like Ollama.
@@ -29,10 +18,11 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/achetronic/adk-utils-go/genai/common"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/shared"
-	"google.golang.org/adk/model"
+	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )
 
@@ -59,6 +49,7 @@ type Model struct {
 
 // HTTPOptions holds optional HTTP-level configuration for the OpenAI client.
 type HTTPOptions struct {
+	Client  *http.Client
 	Headers http.Header
 }
 
@@ -84,6 +75,9 @@ func New(cfg Config) *Model {
 	}
 	if cfg.BaseURL != "" {
 		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
+	}
+	if cfg.HTTPOptions.Client != nil {
+		opts = append(opts, option.WithHTTPClient(cfg.HTTPOptions.Client))
 	}
 	for k, vals := range cfg.HTTPOptions.Headers {
 		for _, v := range vals {
@@ -399,7 +393,7 @@ func (m *Model) convertContentToMessages(content *genai.Content) ([]openai.ChatC
 	for _, part := range content.Parts {
 		switch {
 		case part.FunctionResponse != nil:
-			responseJSON, err := json.Marshal(part.FunctionResponse.Response)
+			responseJSON, err := common.MarshalToolPayload(part.FunctionResponse.Response)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal function response: %w", err)
 			}
@@ -407,7 +401,7 @@ func (m *Model) convertContentToMessages(content *genai.Content) ([]openai.ChatC
 			messages = append(messages, openai.ToolMessage(string(responseJSON), normalizedID))
 
 		case part.FunctionCall != nil:
-			argsJSON, err := json.Marshal(part.FunctionCall.Args)
+			argsJSON, err := common.MarshalToolPayload(part.FunctionCall.Args)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal function args: %w", err)
 			}

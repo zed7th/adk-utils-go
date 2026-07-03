@@ -1,16 +1,5 @@
-// Copyright 2025 achetronic
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
 
 package contextguard
 
@@ -23,10 +12,10 @@ import (
 
 	"google.golang.org/genai"
 
-	"google.golang.org/adk/agent"
-	"google.golang.org/adk/artifact"
-	"google.golang.org/adk/model"
-	"google.golang.org/adk/session"
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/artifact"
+	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/session"
 )
 
 // ---------------------------------------------------------------------------
@@ -65,7 +54,7 @@ func (s *mockState) All() iter.Seq2[string, any] {
 }
 
 type mockCallbackContext struct {
-	context.Context
+	agent.StrictContextMock
 	agentName string
 	sessionID string
 	state     session.State
@@ -73,23 +62,25 @@ type mockCallbackContext struct {
 
 func newMockCallbackContext(agentName string) *mockCallbackContext {
 	return &mockCallbackContext{
-		Context:   context.Background(),
-		agentName: agentName,
-		sessionID: "test-session",
-		state:     newMockState(),
+		StrictContextMock: agent.StrictContextMock{Ctx: context.Background()},
+		agentName:         agentName,
+		sessionID:         "test-session",
+		state:             newMockState(),
 	}
 }
 
-func (m *mockCallbackContext) UserContent() *genai.Content            { return nil }
-func (m *mockCallbackContext) InvocationID() string                   { return "inv-1" }
-func (m *mockCallbackContext) AgentName() string                      { return m.agentName }
-func (m *mockCallbackContext) ReadonlyState() session.ReadonlyState   { return m.state }
-func (m *mockCallbackContext) UserID() string                         { return "user-1" }
-func (m *mockCallbackContext) AppName() string                        { return "test-app" }
-func (m *mockCallbackContext) SessionID() string                      { return m.sessionID }
-func (m *mockCallbackContext) Branch() string                         { return "" }
-func (m *mockCallbackContext) Artifacts() agent.Artifacts             { return &mockArtifacts{} }
-func (m *mockCallbackContext) State() session.State                   { return m.state }
+func (m *mockCallbackContext) UserContent() *genai.Content          { return nil }
+func (m *mockCallbackContext) InvocationID() string                 { return "inv-1" }
+func (m *mockCallbackContext) AgentName() string                    { return m.agentName }
+func (m *mockCallbackContext) ReadonlyState() session.ReadonlyState { return m.state }
+func (m *mockCallbackContext) UserID() string                       { return "user-1" }
+func (m *mockCallbackContext) AppName() string                      { return "test-app" }
+func (m *mockCallbackContext) SessionID() string                    { return m.sessionID }
+func (m *mockCallbackContext) Branch() string                       { return "" }
+func (m *mockCallbackContext) Artifacts() agent.Artifacts           { return &mockArtifacts{} }
+func (m *mockCallbackContext) State() session.State                 { return m.state }
+
+var _ agent.Context = (*mockCallbackContext)(nil)
 
 type mockArtifacts struct{}
 
@@ -759,10 +750,10 @@ func TestPersistAndLoadSummary(t *testing.T) {
 func TestLoadSummary_AgentNameSuffix(t *testing.T) {
 	ctx1 := newMockCallbackContext("agent1")
 	ctx2 := &mockCallbackContext{
-		Context:   context.Background(),
-		agentName: "agent2",
-		sessionID: "test-session",
-		state:     ctx1.state,
+		StrictContextMock: agent.StrictContextMock{Ctx: context.Background()},
+		agentName:         "agent2",
+		sessionID:         "test-session",
+		state:             ctx1.state,
 	}
 
 	persistSummary(ctx1, "summary for agent1", 1000)
@@ -1843,10 +1834,10 @@ func TestThresholdStrategy_InjectsContinuation(t *testing.T) {
 	s := newThresholdStrategy(registry, llm, 0, defaultMaxCompactionAttempts)
 
 	ctx := &mockCallbackContext{
-		Context:   context.Background(),
-		agentName: "agent1",
-		sessionID: "test-session",
-		state:     newMockState(),
+		StrictContextMock: agent.StrictContextMock{Ctx: context.Background()},
+		agentName:         "agent1",
+		sessionID:         "test-session",
+		state:             newMockState(),
 	}
 
 	req := &model.LLMRequest{

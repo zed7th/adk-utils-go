@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
+
 package contextguard
 
 import (
@@ -7,7 +10,7 @@ import (
 
 	"google.golang.org/genai"
 
-	"google.golang.org/adk/model"
+	"google.golang.org/adk/v2/model"
 )
 
 // ==========================================================================
@@ -48,15 +51,15 @@ type sessionConfig struct {
 	systemPromptSize int
 	modelName        string
 	hasUsageMetadata bool
-	tokenRatio       float64      // real_tokens / heuristic_tokens (simulates tokenizer accuracy)
+	tokenRatio       float64       // real_tokens / heuristic_tokens (simulates tokenizer accuracy)
 	tools            []*genai.Tool // tool definitions attached to every LLM request
 }
 
 type turnConfig struct {
 	userMessage  string
 	toolCalls    []toolCall
-	responseSize int  // chars in model's text response (0 = default ~120 chars)
-	sequential   bool // if true, each toolCall is a separate round (sequential chain)
+	responseSize int                // chars in model's text response (0 = default ~120 chars)
+	sequential   bool               // if true, each toolCall is a separate round (sequential chain)
 	inlineData   []inlineAttachment // inline blobs attached to the user message
 }
 
@@ -84,22 +87,22 @@ type sessionResult struct {
 //
 // For each user turn:
 //
-//	1. Append user message to contents (session history)
-//	2. ADK inner loop:
-//	   a. Build fresh LLMRequest from current contents + system instruction
-//	   b. BeforeModelCallback: guard.beforeModel(ctx, req)
-//	      - May compact req.Contents (summary + continuation)
-//	      - Persists lastHeuristic of the FINAL request
-//	   c. Sync compacted contents back to our session history
-//	   d. Track overflow: the "real" token count is heuristic × tokenRatio
-//	   e. AfterModelCallback: guard.afterModel with simulated UsageMetadata
-//	   f. If model returns tool calls:
-//	      - Append model Content with FunctionCall parts (parallel in one Content)
-//	      - Execute tools, append user Content with FunctionResponse parts
-//	      - CONTINUE inner loop (go to step 2a)
-//	   g. If model returns text:
-//	      - Append model text response to contents
-//	      - BREAK inner loop (wait for next user message)
+//  1. Append user message to contents (session history)
+//  2. ADK inner loop:
+//     a. Build fresh LLMRequest from current contents + system instruction
+//     b. BeforeModelCallback: guard.beforeModel(ctx, req)
+//     - May compact req.Contents (summary + continuation)
+//     - Persists lastHeuristic of the FINAL request
+//     c. Sync compacted contents back to our session history
+//     d. Track overflow: the "real" token count is heuristic × tokenRatio
+//     e. AfterModelCallback: guard.afterModel with simulated UsageMetadata
+//     f. If model returns tool calls:
+//     - Append model Content with FunctionCall parts (parallel in one Content)
+//     - Execute tools, append user Content with FunctionResponse parts
+//     - CONTINUE inner loop (go to step 2a)
+//     g. If model returns text:
+//     - Append model text response to contents
+//     - BREAK inner loop (wait for next user message)
 func simulateSession(t *testing.T, cfg sessionConfig, turns []turnConfig) sessionResult {
 	t.Helper()
 

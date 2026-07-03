@@ -1,16 +1,5 @@
-// Copyright 2025 achetronic
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
 
 package redis
 
@@ -24,14 +13,14 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"google.golang.org/adk/session"
+	"google.golang.org/adk/v2/session"
 )
 
 // RedisSessionService implements session.Service using Redis as the backend.
 type RedisSessionService struct {
-	client      *redis.Client
-	ttl         time.Duration
-	appStateTTL time.Duration
+	client       *redis.Client
+	ttl          time.Duration
+	appStateTTL  time.Duration
 	userStateTTL time.Duration
 }
 
@@ -430,7 +419,7 @@ func unmarshalHashFields(fields map[string]string) map[string]any {
 }
 
 // extractStateDeltas splits a flat state map into three separate maps based on
-// key prefixes, mirroring google.golang.org/adk/internal/sessionutils.ExtractStateDeltas.
+// key prefixes, mirroring google.golang.org/adk/v2/internal/sessionutils.ExtractStateDeltas.
 // Keys with the "temp:" prefix are discarded.
 func extractStateDeltas(delta map[string]any) (appDelta, userDelta, sessionDelta map[string]any) {
 	appDelta = make(map[string]any)
@@ -465,7 +454,7 @@ func extractSingleKey(key string, value any) (app, user, sessionOnly map[string]
 
 // mergeStates combines app, user, and session state maps into a single flat map,
 // re-adding the appropriate prefixes, mirroring
-// google.golang.org/adk/internal/sessionutils.MergeStates.
+// google.golang.org/adk/v2/internal/sessionutils.MergeStates.
 func mergeStates(appState, userState, sessionState map[string]any) map[string]any {
 	totalSize := len(appState) + len(userState) + len(sessionState)
 	merged := make(map[string]any, totalSize)

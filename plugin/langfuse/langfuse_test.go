@@ -1,16 +1,5 @@
-// Copyright 2025 achetronic
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
 
 package langfuse
 
@@ -28,10 +17,10 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
-	"google.golang.org/adk/agent"
-	"google.golang.org/adk/artifact"
-	"google.golang.org/adk/model"
-	"google.golang.org/adk/session"
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/artifact"
+	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/session"
 	"google.golang.org/genai"
 )
 
@@ -75,7 +64,7 @@ func (a *mockArtifacts) LoadVersion(_ context.Context, _ string, _ int) (*artifa
 }
 
 type mockCallbackContext struct {
-	context.Context
+	agent.StrictContextMock
 	agentName    string
 	invocationID string
 	branch       string
@@ -87,12 +76,12 @@ type mockCallbackContext struct {
 
 func newMockCtx() *mockCallbackContext {
 	return &mockCallbackContext{
-		Context:      context.Background(),
-		agentName:    "test-agent",
-		invocationID: "inv-1",
-		userID:       "user-1",
-		sessionID:    "session-1",
-		state:        newMockState(),
+		StrictContextMock: agent.StrictContextMock{Ctx: context.Background()},
+		agentName:         "test-agent",
+		invocationID:      "inv-1",
+		userID:            "user-1",
+		sessionID:         "session-1",
+		state:             newMockState(),
 	}
 }
 
@@ -107,11 +96,13 @@ func (m *mockCallbackContext) Branch() string                       { return m.b
 func (m *mockCallbackContext) Artifacts() agent.Artifacts           { return &mockArtifacts{} }
 func (m *mockCallbackContext) State() session.State                 { return m.state }
 
+var _ agent.Context = (*mockCallbackContext)(nil)
+
 func mockCtxWithSpan(tp oteltrace.TracerProvider, name string) (*mockCallbackContext, oteltrace.Span) {
 	tracer := tp.Tracer("test")
 	ctx, span := tracer.Start(context.Background(), name)
 	m := newMockCtx()
-	m.Context = ctx
+	m.Ctx = ctx
 	return m, span
 }
 
@@ -529,12 +520,12 @@ func TestSpanEnricher_BeforeAgent_SetsAllAttributes(t *testing.T) {
 	ctx, span := mockCtxWithSpan(tp, "invoke_agent")
 	ctx.userID = "adk-user"
 	ctx.sessionID = "sess-42"
-	ctx.Context = WithUserID(ctx.Context, "langfuse-user")
-	ctx.Context = WithTags(ctx.Context, []string{"tag1", "tag2"})
-	ctx.Context = WithTraceMetadata(ctx.Context, map[string]string{"team": "sre"})
-	ctx.Context = WithEnvironment(ctx.Context, "staging")
-	ctx.Context = WithRelease(ctx.Context, "v2.0")
-	ctx.Context = WithTraceName(ctx.Context, "my-trace")
+	ctx.Ctx = WithUserID(ctx.Ctx, "langfuse-user")
+	ctx.Ctx = WithTags(ctx.Ctx, []string{"tag1", "tag2"})
+	ctx.Ctx = WithTraceMetadata(ctx.Ctx, map[string]string{"team": "sre"})
+	ctx.Ctx = WithEnvironment(ctx.Ctx, "staging")
+	ctx.Ctx = WithRelease(ctx.Ctx, "v2.0")
+	ctx.Ctx = WithTraceName(ctx.Ctx, "my-trace")
 	ctx.userContent = &genai.Content{Parts: []*genai.Part{{Text: "hello agent"}}}
 
 	e.beforeAgent(ctx)
@@ -965,8 +956,8 @@ func TestFullFlow_SingleTurn(t *testing.T) {
 	invokeCtx, invokeSpan := tracer.Start(context.Background(), "invoke_agent")
 
 	mctx := newMockCtx()
-	mctx.Context = invokeCtx
-	mctx.Context = WithUserID(mctx.Context, "alice")
+	mctx.Ctx = invokeCtx
+	mctx.Ctx = WithUserID(mctx.Ctx, "alice")
 	mctx.sessionID = "sess-1"
 	mctx.userContent = &genai.Content{Parts: []*genai.Part{{Text: "what is k8s?"}}}
 
@@ -1047,7 +1038,7 @@ func TestFullFlow_ToolCallThenFinalAnswer(t *testing.T) {
 
 	invokeCtx, invokeSpan := tracer.Start(context.Background(), "invoke_agent")
 	mctx := newMockCtx()
-	mctx.Context = invokeCtx
+	mctx.Ctx = invokeCtx
 
 	e.beforeAgent(mctx)
 

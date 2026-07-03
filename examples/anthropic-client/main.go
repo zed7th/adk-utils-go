@@ -1,16 +1,5 @@
-// Copyright 2025 achetronic
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
 
 // Anthropic Client Example
 //
@@ -21,7 +10,9 @@
 //	ANTHROPIC_API_KEY        - Anthropic API key (required)
 //	MODEL_NAME               - Model to use (default: claude-sonnet-4-5-20250929)
 //	MAX_OUTPUT_TOKENS        - Max output tokens (default: 4096)
-//	THINKING_BUDGET_TOKENS   - Output tokens reserved for extended thinking; 0 disables it (default: 0)
+//	THINKING_BUDGET_TOKENS   - Classic ("enabled") API: output tokens reserved for thinking; 0 disables it (default: 0)
+//	THINKING_EFFORT          - Adaptive ("adaptive") API for Opus 4.5+: low|medium|high; empty disables it
+//	THINKING_MODE            - Force the reasoning API: enabled | adaptive (default: empty = auto-deduce)
 
 package main
 
@@ -32,10 +23,10 @@ import (
 	"os"
 	"strconv"
 
-	"google.golang.org/adk/agent"
-	"google.golang.org/adk/agent/llmagent"
-	"google.golang.org/adk/runner"
-	"google.golang.org/adk/session"
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/agent/llmagent"
+	"google.golang.org/adk/v2/runner"
+	"google.golang.org/adk/v2/session"
 	"google.golang.org/genai"
 
 	genaianthropic "github.com/achetronic/adk-utils-go/genai/anthropic"
@@ -51,10 +42,16 @@ func main() {
 	// 1. Create the Anthropic client
 	//    This is all you need to switch from Gemini to Anthropic
 	llmModel := genaianthropic.New(genaianthropic.Config{
-		APIKey:               os.Getenv("ANTHROPIC_API_KEY"),
-		ModelName:            getEnvOrDefault("MODEL_NAME", "claude-sonnet-4-5-20250929"),
-		MaxOutputTokens:      getEnvInt("MAX_OUTPUT_TOKENS", 0),
+		APIKey:          os.Getenv("ANTHROPIC_API_KEY"),
+		ModelName:       getEnvOrDefault("MODEL_NAME", "claude-sonnet-4-5-20250929"),
+		MaxOutputTokens: getEnvInt("MAX_OUTPUT_TOKENS", 0),
+		// Reasoning has two APIs, picked per model (see README):
+		//   - classic budget-based ("enabled"): set THINKING_BUDGET_TOKENS
+		//   - effort-based adaptive ("adaptive", Opus 4.5+): set THINKING_EFFORT
+		// ThinkingMode forces the API; empty auto-deduces from the field set.
 		ThinkingBudgetTokens: getEnvInt("THINKING_BUDGET_TOKENS", 0),
+		ThinkingEffort:       os.Getenv("THINKING_EFFORT"),
+		ThinkingMode:         os.Getenv("THINKING_MODE"),
 	})
 
 	// 2. Create an agent using the Anthropic model

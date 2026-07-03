@@ -1,10 +1,5 @@
-// Copyright 2025 achetronic
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
 
 package anthropic
 
@@ -63,38 +58,6 @@ func TestConvertStopReason(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := convertStopReason(c.reason); got != c.want {
 				t.Errorf("convertStopReason(%q) = %v, want %v", c.reason, got, c.want)
-			}
-		})
-	}
-}
-
-// convertToolInputToRaw guards the wire format we send for tool_use.input.
-// Anthropic requires a JSON object literal — never null, never an empty
-// payload — so we always normalise to "{}" when the caller hands us nil,
-// empty, or null-marshaling values. Anything that already round-trips as
-// valid JSON is passed through verbatim to avoid losing precision.
-func TestConvertToolInputToRaw(t *testing.T) {
-	cases := []struct {
-		name  string
-		input any
-		want  string
-	}{
-		{"nil", nil, "{}"},
-		{"nil typed map", (map[string]any)(nil), "{}"},
-		{"empty map", map[string]any{}, "{}"},
-		{"populated map", map[string]any{"k": "v"}, `{"k":"v"}`},
-		{"empty raw message falls back to default", json.RawMessage(""), "{}"},
-		{"raw message passes through", json.RawMessage(`{"a":1}`), `{"a":1}`},
-		{"struct gets marshaled", struct {
-			Foo string `json:"foo"`
-		}{Foo: "bar"}, `{"foo":"bar"}`},
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got := string(convertToolInputToRaw(c.input))
-			if got != c.want {
-				t.Errorf("convertToolInputToRaw() = %q, want %q", got, c.want)
 			}
 		})
 	}

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // Copyright 2025 achetronic
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -104,7 +107,7 @@ func TestConvertToFunctionParams(t *testing.T) {
 			want: map[string]any{
 				"type":                 "object",
 				"additionalProperties": false,
-				"required":            []any{"prompt", "heightRatio"},
+				"required":             []any{"prompt", "heightRatio"},
 				"properties": map[string]any{
 					"prompt":      map[string]any{"type": "string"},
 					"heightRatio": map[string]any{"type": []any{"integer", "null"}},
@@ -116,8 +119,8 @@ func TestConvertToFunctionParams(t *testing.T) {
 			in:   nil,
 			want: map[string]any{
 				"type":                 "object",
-				"properties":          map[string]any{},
-				"required":            []any{},
+				"properties":           map[string]any{},
+				"required":             []any{},
 				"additionalProperties": false,
 			},
 		},
@@ -140,13 +143,13 @@ func TestConvertToFunctionParams(t *testing.T) {
 			want: map[string]any{
 				"type":                 "object",
 				"additionalProperties": false,
-				"required":            []any{"name", "opts"},
+				"required":             []any{"name", "opts"},
 				"properties": map[string]any{
 					"name": map[string]any{"type": "string"},
 					"opts": map[string]any{
 						"type":                 []any{"object", "null"},
 						"additionalProperties": false,
-						"required":            []any{"color"},
+						"required":             []any{"color"},
 						"properties": map[string]any{
 							"color": map[string]any{"type": "string"},
 						},
@@ -165,7 +168,7 @@ func TestConvertToFunctionParams(t *testing.T) {
 			want: map[string]any{
 				"type":                 "object",
 				"additionalProperties": false,
-				"required":            []any{"env"},
+				"required":             []any{"env"},
 				"properties": map[string]any{
 					"env": map[string]any{"type": []any{"string", "null"}},
 				},

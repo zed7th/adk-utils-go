@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // Copyright 2025 achetronic
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,7 +14,7 @@ package responses
 import (
 	"testing"
 
-	"google.golang.org/adk/model"
+	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )
 
