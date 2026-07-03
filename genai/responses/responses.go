@@ -24,8 +24,22 @@
 // This adapter drives the API statelessly to match ADK's model: ADK owns the
 // conversation state and passes the full history on every call, so each request
 // replays that history as input items instead of chaining server-side state via
-// previous_response_id. Reasoning items reference server-side IDs from their
-// originating response, so they are surfaced to ADK but not replayed back.
+// previous_response_id. Requests are sent with store=false so nothing is
+// persisted server-side, and reasoning is requested with encrypted_content so
+// reasoning items can be replayed across turns: this keeps the model's chain
+// of thought available between tool calls, as reasoning models require.
+// Reasoning items without encrypted content (e.g. from gateways that do not
+// support the include parameter) are skipped on replay, since their bare IDs
+// only resolve in the context of the originating response.
+//
+// Encrypted reasoning content is bound to the credentials that produced it:
+// the API encrypts it with the organization's key, and replaying it through a
+// different provider, API key, or model fails with a 400
+// invalid_encrypted_content error. Sessions may switch channels mid-flight
+// (e.g. OpenAI to Azure fallback), so each reasoning part records the origin
+// (a fingerprint of base URL, API key, and model) and is replayed only when
+// it matches the requesting model; otherwise the encrypted content is
+// dropped and the turn degrades gracefully to fresh reasoning.
 //
 // For OpenAI-compatible gateways (Ollama, vLLM, DeepSeek, Kimi, etc.) that only
 // expose the Chat Completions endpoint, use the genai/openai package instead.
@@ -33,12 +47,16 @@ package responses
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
 	"net/http"
+	"os"
+	"sort"
 	"strings"
 
 	"github.com/openai/openai-go/v3"
@@ -60,6 +78,10 @@ var (
 type Model struct {
 	client    *openai.Client
 	modelName string
+	// origin fingerprints the channel (base URL, API key, model) this Model
+	// talks to. Encrypted reasoning content is only replayed to the channel
+	// that produced it; see the package documentation.
+	origin string
 }
 
 // HTTPOptions holds optional HTTP-level configuration for the OpenAI client.
@@ -97,10 +119,30 @@ func New(cfg Config) *Model {
 
 	client := openai.NewClient(opts...)
 
+	apiKey := cfg.APIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+
 	return &Model{
 		client:    &client,
 		modelName: cfg.ModelName,
+		origin:    computeOrigin(cfg.BaseURL, apiKey, cfg.ModelName),
 	}
+}
+
+// computeOrigin fingerprints a channel so encrypted reasoning content is only
+// replayed to the channel that produced it. The API encrypts reasoning with
+// the organization's key, so any change of provider, API key, or model makes
+// previously captured content undecryptable (400 invalid_encrypted_content).
+// The fingerprint deliberately covers all three dimensions.
+func computeOrigin(baseURL, apiKey, modelName string) string {
+	h := sha256.New()
+	for _, s := range []string{baseURL, apiKey, modelName} {
+		h.Write([]byte(s))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // Name returns the model name.
@@ -132,7 +174,7 @@ func (m *Model) generate(ctx context.Context, req *model.LLMRequest) iter.Seq2[*
 			return
 		}
 
-		llmResp, err := convertResponse(resp)
+		llmResp, err := convertResponse(resp, m.origin)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -202,9 +244,21 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 					return
 				}
 
+			case "response.output_item.done":
+				// Completed function calls are accumulated so the fallback
+				// final event includes them: losing a tool call would
+				// silently break the agent loop.
+				if event.Item.Type == "function_call" {
+					acc.functionCalls = append(acc.functionCalls, &genai.FunctionCall{
+						ID:   event.Item.CallID,
+						Name: event.Item.Name,
+						Args: parseJSONArgs(event.Item.Arguments.OfString),
+					})
+				}
+
 			case "response.completed", "response.incomplete":
 				resp := &event.Response
-				llmResp, err := convertResponse(resp)
+				llmResp, err := convertResponse(resp, m.origin)
 				if err != nil || hasNoContent(llmResp) {
 					// The terminal event carried no aggregated output: rebuild the
 					// final response from the accumulated deltas, otherwise ADK
@@ -246,23 +300,25 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 	}
 }
 
-// streamAccumulator collects streamed delta text so a complete final response
-// can be rebuilt when the terminal event lacks the aggregated output. reasoning
-// holds the reasoning summary; text holds the final answer.
+// streamAccumulator collects streamed deltas so a complete final response
+// can be rebuilt when the terminal event lacks the aggregated output.
+// reasoning holds the reasoning summary; text holds the final answer;
+// functionCalls holds tool calls completed during the stream.
 type streamAccumulator struct {
-	reasoning strings.Builder
-	text      strings.Builder
+	reasoning     strings.Builder
+	text          strings.Builder
+	functionCalls []*genai.FunctionCall
 }
 
 // hasContent reports whether anything was accumulated that could be used to
 // rebuild a final response.
 func (a *streamAccumulator) hasContent() bool {
-	return a.reasoning.Len() > 0 || a.text.Len() > 0
+	return a.reasoning.Len() > 0 || a.text.Len() > 0 || len(a.functionCalls) > 0
 }
 
 // finalResponse builds a non-partial final response from the accumulated deltas
-// (for ADK to persist). The reasoning part precedes the answer part, matching
-// the temporal order in which they were streamed.
+// (for ADK to persist). The reasoning part precedes the answer part, which
+// precedes the tool calls, matching the temporal order in which they streamed.
 func (a *streamAccumulator) finalResponse(
 	finishReason genai.FinishReason,
 	usage *genai.GenerateContentResponseUsageMetadata,
@@ -273,6 +329,9 @@ func (a *streamAccumulator) finalResponse(
 	}
 	if a.text.Len() > 0 {
 		content.Parts = append(content.Parts, &genai.Part{Text: a.text.String()})
+	}
+	for _, fc := range a.functionCalls {
+		content.Parts = append(content.Parts, &genai.Part{FunctionCall: fc})
 	}
 	return &model.LLMResponse{
 		Content:       content,
@@ -293,6 +352,14 @@ func hasNoContent(resp *model.LLMResponse) bool {
 func (m *Model) buildResponseParams(req *model.LLMRequest) (responses.ResponseNewParams, error) {
 	params := responses.ResponseNewParams{
 		Model: shared.ResponsesModel(m.modelName),
+		// ADK owns the conversation state, so nothing needs to be stored
+		// server-side. store=false also makes the API return encrypted
+		// reasoning content (requested via include below), which is the only
+		// way to replay reasoning items in a stateless flow.
+		Store: param.NewOpt(false),
+		Include: []responses.ResponseIncludable{
+			responses.ResponseIncludableReasoningEncryptedContent,
+		},
 	}
 
 	// System instruction → instructions field
@@ -305,7 +372,7 @@ func (m *Model) buildResponseParams(req *model.LLMRequest) (responses.ResponseNe
 	// Conversation history → input items
 	var input responses.ResponseInputParam
 	for _, content := range req.Contents {
-		items, err := convertContentToInputItems(content)
+		items, err := convertContentToInputItems(content, m.origin)
 		if err != nil {
 			return responses.ResponseNewParams{}, err
 		}
@@ -317,14 +384,16 @@ func (m *Model) buildResponseParams(req *model.LLMRequest) (responses.ResponseNe
 
 	// Generation config
 	if req.Config != nil {
-		applyGenerationConfig(&params, req.Config)
+		if err := applyGenerationConfig(&params, req.Config); err != nil {
+			return responses.ResponseNewParams{}, err
+		}
 	}
 
 	return params, nil
 }
 
 // applyGenerationConfig applies optional generation settings to the request params.
-func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.GenerateContentConfig) {
+func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.GenerateContentConfig) error {
 	if cfg.Temperature != nil {
 		params.Temperature = param.NewOpt(float64(*cfg.Temperature))
 	}
@@ -352,28 +421,35 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 		}
 	}
 
-	// Structured output with schema (also strict-normalised)
+	// Structured output with schema (also strict-normalised). Conversion
+	// errors are returned rather than swallowed: silently dropping the
+	// schema or the tools would send the request anyway and surface as
+	// inexplicable model behaviour.
 	if cfg.ResponseSchema != nil {
-		if schemaMap, err := convertSchema(cfg.ResponseSchema); err == nil {
-			normalizeStrictSchema(schemaMap)
-			params.Text = responses.ResponseTextConfigParam{
-				Format: responses.ResponseFormatTextConfigUnionParam{
-					OfJSONSchema: &responses.ResponseFormatTextJSONSchemaConfigParam{
-						Name:        "response",
-						Description: param.NewOpt(cfg.ResponseSchema.Description),
-						Schema:      schemaMap,
-						Strict:      param.NewOpt(true),
-					},
+		schemaMap, err := convertSchema(cfg.ResponseSchema)
+		if err != nil {
+			return fmt.Errorf("failed to convert response schema: %w", err)
+		}
+		normalizeStrictSchema(schemaMap)
+		params.Text = responses.ResponseTextConfigParam{
+			Format: responses.ResponseFormatTextConfigUnionParam{
+				OfJSONSchema: &responses.ResponseFormatTextJSONSchemaConfigParam{
+					Name:        "response",
+					Description: param.NewOpt(cfg.ResponseSchema.Description),
+					Schema:      schemaMap,
+					Strict:      param.NewOpt(true),
 				},
-			}
+			},
 		}
 	}
 
 	// Tools
 	if len(cfg.Tools) > 0 {
-		if tools, err := convertTools(cfg.Tools); err == nil {
-			params.Tools = tools
+		tools, err := convertTools(cfg.Tools)
+		if err != nil {
+			return fmt.Errorf("failed to convert tools: %w", err)
 		}
+		params.Tools = tools
 	}
 
 	// ToolConfig → tool_choice
@@ -402,17 +478,36 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 			}
 		}
 	}
+
+	return nil
 }
 
 // convertContentToInputItems converts a genai.Content into Responses API input items.
 // A single Content may produce multiple items: text/media coalesce into a message,
-// while FunctionCall and FunctionResponse become separate typed items.
-func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInputItemUnionParam, error) {
+// while FunctionCall and FunctionResponse become separate typed items. origin
+// identifies the requesting channel: encrypted reasoning is only replayed when
+// it was captured from the same origin.
+func convertContentToInputItems(content *genai.Content, origin string) ([]responses.ResponseInputItemUnionParam, error) {
 	var items []responses.ResponseInputItemUnionParam
 	var textParts []string
 	var mediaParts []responses.ResponseInputContentUnionParam
 	var phase string
 	role := convertRole(content.Role)
+
+	// A replayed reasoning item must be followed by another item from the
+	// same turn (message or function call), or the API rejects it as
+	// dangling. Track the last part that produces such an item so trailing
+	// thoughts (e.g. from an interrupted turn) are not replayed.
+	lastFollower := -1
+	for i, part := range content.Parts {
+		if part.Thought {
+			continue
+		}
+		if part.FunctionCall != nil || part.FunctionResponse != nil ||
+			part.Text != "" || part.InlineData != nil || part.FileData != nil {
+			lastFollower = i
+		}
+	}
 
 	flushMessage := func() {
 		if len(textParts) == 0 && len(mediaParts) == 0 {
@@ -420,7 +515,7 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 		}
 
 		// Model output with phase metadata → build OutputMessage manually to
-		// preserve phase and message ID for GPT-5.3-Codex+ round-tripping.
+		// preserve the phase field for GPT-5.3-Codex+ round-tripping.
 		if role == responses.EasyInputMessageRoleAssistant && phase != "" {
 			var contentParts []responses.ResponseOutputMessageContentUnionParam
 			for _, t := range textParts {
@@ -456,7 +551,7 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 		phase = ""
 	}
 
-	for _, part := range content.Parts {
+	for i, part := range content.Parts {
 		switch {
 		case part.FunctionResponse != nil:
 			flushMessage()
@@ -479,12 +574,50 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 			))
 
 		case part.Thought:
-			// Reasoning summaries are informational for the client. They
-			// reference server-side IDs that only exist in the context of
-			// the originating response. Replaying them without
-			// previous_response_id causes a 400 "Item not found" error,
-			// so we skip them entirely.
-			continue
+			// Reasoning items carrying encrypted content are replayed so the
+			// model keeps its chain of thought across turns; reasoning models
+			// require the reasoning item preceding a function_call to be
+			// present in the input. Skipped instead of replayed when:
+			//   - the content is not an assistant turn: in multi-agent
+			//     histories another agent's output (thoughts included) shows
+			//     up under other roles, where a reasoning item is invalid;
+			//   - there is no encrypted content (e.g. gateways that ignore
+			//     the include parameter): bare IDs only resolve in the
+			//     originating response and replaying them is a 400;
+			//   - the origin does not match: encrypted content is bound to
+			//     the provider/API key/model that produced it, and replaying
+			//     it elsewhere is a 400 invalid_encrypted_content;
+			//   - no item from the same turn follows: the API rejects
+			//     dangling reasoning items.
+			// Skipping degrades gracefully: the model re-derives its
+			// reasoning for the turn instead of the request failing.
+			if role != responses.EasyInputMessageRoleAssistant {
+				continue
+			}
+			enc, _ := part.PartMetadata["encrypted_content"].(string)
+			id, _ := part.PartMetadata["reasoning_id"].(string)
+			if enc == "" || id == "" {
+				continue
+			}
+			if partOrigin, _ := part.PartMetadata["reasoning_origin"].(string); origin == "" || partOrigin != origin {
+				continue
+			}
+			if i > lastFollower {
+				continue
+			}
+			flushMessage()
+			reasoning := responses.ResponseReasoningItemParam{
+				ID:               id,
+				Summary:          []responses.ResponseReasoningItemSummaryParam{},
+				EncryptedContent: param.NewOpt(enc),
+			}
+			if part.Text != "" {
+				reasoning.Summary = append(reasoning.Summary,
+					responses.ResponseReasoningItemSummaryParam{Text: part.Text})
+			}
+			items = append(items, responses.ResponseInputItemUnionParam{
+				OfReasoning: &reasoning,
+			})
 
 		case part.Text != "":
 			if part.PartMetadata != nil {
@@ -515,7 +648,10 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 }
 
 // convertResponse transforms a Responses API response into an LLMResponse.
-func convertResponse(resp *responses.Response) (*model.LLMResponse, error) {
+// origin identifies the channel that produced the response; it is recorded
+// alongside encrypted reasoning content so replay can be restricted to the
+// same channel.
+func convertResponse(resp *responses.Response, origin string) (*model.LLMResponse, error) {
 	if len(resp.Output) == 0 {
 		return nil, ErrNoOutputInResponse
 	}
@@ -528,17 +664,28 @@ func convertResponse(resp *responses.Response) (*model.LLMResponse, error) {
 	for _, item := range resp.Output {
 		switch item.Type {
 		case "reasoning":
+			// One part per reasoning item, even when the summary is empty:
+			// the encrypted content must survive the round-trip through ADK
+			// history so the item can be replayed on the next turn.
+			var summaryTexts []string
 			for _, summary := range item.Summary {
 				if summary.Text != "" {
-					part := &genai.Part{Text: summary.Text, Thought: true}
-					meta := map[string]any{"reasoning_id": item.ID}
-					if item.EncryptedContent != "" {
-						meta["encrypted_content"] = item.EncryptedContent
-					}
-					part.PartMetadata = meta
-					content.Parts = append(content.Parts, part)
+					summaryTexts = append(summaryTexts, summary.Text)
 				}
 			}
+			if len(summaryTexts) == 0 && item.EncryptedContent == "" {
+				continue
+			}
+			meta := map[string]any{"reasoning_id": item.ID}
+			if item.EncryptedContent != "" {
+				meta["encrypted_content"] = item.EncryptedContent
+				meta["reasoning_origin"] = origin
+			}
+			content.Parts = append(content.Parts, &genai.Part{
+				Text:         joinTexts(summaryTexts),
+				Thought:      true,
+				PartMetadata: meta,
+			})
 
 		case "message":
 			for _, cp := range item.Content {
@@ -591,15 +738,23 @@ func convertTools(genaiTools []*genai.Tool) ([]responses.ToolUnionParam, error) 
 
 		for _, funcDecl := range genaiTool.FunctionDeclarations {
 			params := funcDecl.ParametersJsonSchema
-			if params == nil {
+			// Assign only a non-nil *genai.Schema: a nil pointer stored in
+			// the interface would defeat the nil check that gives
+			// parameterless tools a valid empty object schema.
+			if params == nil && funcDecl.Parameters != nil {
 				params = funcDecl.Parameters
+			}
+
+			strictParams := convertToStrictFunctionParams(params)
+			if strictParams == nil {
+				return nil, fmt.Errorf("parameters of tool %q cannot be converted to a JSON schema object", funcDecl.Name)
 			}
 
 			tools = append(tools, responses.ToolUnionParam{
 				OfFunction: &responses.FunctionToolParam{
 					Name:        funcDecl.Name,
 					Description: param.NewOpt(funcDecl.Description),
-					Parameters:  convertToStrictFunctionParams(params),
+					Parameters:  strictParams,
 					Strict:      param.NewOpt(true),
 				},
 			})
@@ -799,6 +954,12 @@ func normalizeStrictSchema(schema map[string]any) {
 			makeNullable(props[key])
 		}
 	}
+	// Sort for a deterministic order: map iteration is randomised, and an
+	// unstable "required" array changes the serialized tool definition on
+	// every request, which breaks OpenAI prompt-cache prefix matching.
+	sort.Slice(allKeys, func(i, j int) bool {
+		return allKeys[i].(string) < allKeys[j].(string)
+	})
 	schema["required"] = allKeys
 }
 

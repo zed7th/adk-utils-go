@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/openai/openai-go/v3/responses"
+	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )
 
@@ -28,7 +29,7 @@ import (
 
 func TestConvertResponse_EmptyOutput(t *testing.T) {
 	resp := &responses.Response{}
-	_, err := convertResponse(resp)
+	_, err := convertResponse(resp, "test-origin")
 	if !errors.Is(err, ErrNoOutputInResponse) {
 		t.Errorf("err = %v, want %v", err, ErrNoOutputInResponse)
 	}
@@ -55,7 +56,7 @@ func TestConvertResponse_TextOnly(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -94,7 +95,7 @@ func TestConvertResponse_ToolCall(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -143,7 +144,7 @@ func TestConvertResponse_TextPlusToolCall(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -189,7 +190,7 @@ func TestConvertResponse_WithReasoning(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -209,6 +210,110 @@ func TestConvertResponse_WithReasoning(t *testing.T) {
 	pm := got.Content.Parts[0].PartMetadata
 	if pm == nil || pm["reasoning_id"] != "rs-1" {
 		t.Errorf("PartMetadata = %v, want reasoning_id=rs-1", pm)
+	}
+}
+
+// A reasoning item with encrypted content but an empty summary (common for
+// reasoning models) must still produce a thought part: dropping it would
+// lose the encrypted content needed to replay the item on the next turn.
+func TestConvertResponse_EncryptedReasoningWithoutSummary(t *testing.T) {
+	raw := []byte(`{
+		"id": "resp-6",
+		"status": "completed",
+		"output": [
+			{
+				"type": "reasoning",
+				"id": "rs-1",
+				"summary": [],
+				"encrypted_content": "enc-blob"
+			},
+			{
+				"type": "message",
+				"id": "msg-1",
+				"role": "assistant",
+				"status": "completed",
+				"content": [{"type": "output_text", "text": "The answer is 42."}]
+			}
+		],
+		"usage": {"input_tokens": 5, "output_tokens": 10, "total_tokens": 15,
+			"input_tokens_details": {"cached_tokens": 0},
+			"output_tokens_details": {"reasoning_tokens": 7}}
+	}`)
+
+	var resp responses.Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	got, err := convertResponse(&resp, "test-origin")
+	if err != nil {
+		t.Fatalf("convertResponse: %v", err)
+	}
+	if len(got.Content.Parts) != 2 {
+		t.Fatalf("expected 2 parts, got %d", len(got.Content.Parts))
+	}
+	thought := got.Content.Parts[0]
+	if !thought.Thought || thought.Text != "" {
+		t.Errorf("first part should be an empty-text thought: %#v", thought)
+	}
+	pm := thought.PartMetadata
+	if pm == nil || pm["reasoning_id"] != "rs-1" || pm["encrypted_content"] != "enc-blob" {
+		t.Errorf("PartMetadata = %v, want reasoning_id=rs-1 and encrypted_content=enc-blob", pm)
+	}
+	// The origin must be recorded so replay is restricted to the channel
+	// that produced the encrypted content.
+	if pm["reasoning_origin"] != "test-origin" {
+		t.Errorf("reasoning_origin = %v, want test-origin", pm["reasoning_origin"])
+	}
+}
+
+// The origin fingerprint gates encrypted-reasoning replay to the channel
+// that produced it: it must be stable for identical configs and change when
+// any of base URL, API key, or model changes.
+func TestComputeOrigin(t *testing.T) {
+	base := computeOrigin("https://api.openai.com/v1", "sk-a", "gpt-5.5")
+
+	if computeOrigin("https://api.openai.com/v1", "sk-a", "gpt-5.5") != base {
+		t.Errorf("origin is not stable for identical inputs")
+	}
+	variants := map[string]string{
+		"base URL": computeOrigin("https://azure.example.com/v1", "sk-a", "gpt-5.5"),
+		"API key":  computeOrigin("https://api.openai.com/v1", "sk-b", "gpt-5.5"),
+		"model":    computeOrigin("https://api.openai.com/v1", "sk-a", "gpt-5.6"),
+	}
+	for dim, got := range variants {
+		if got == base {
+			t.Errorf("origin did not change when %s changed", dim)
+		}
+	}
+	// Field boundaries must be unambiguous: shifting a character across the
+	// URL/key boundary must not collide.
+	if computeOrigin("ab", "c", "m") == computeOrigin("a", "bc", "m") {
+		t.Errorf("origin collides across field boundaries")
+	}
+}
+
+// Every request must run statelessly: store=false so nothing persists
+// server-side, and encrypted reasoning requested so reasoning items can be
+// replayed across turns.
+func TestBuildResponseParams_StatelessDefaults(t *testing.T) {
+	m := New(Config{APIKey: "test", ModelName: "gpt-5.5"})
+
+	params, err := m.buildResponseParams(&model.LLMRequest{})
+	if err != nil {
+		t.Fatalf("buildResponseParams: %v", err)
+	}
+	if !params.Store.Valid() || params.Store.Value {
+		t.Errorf("Store = %+v, want false", params.Store)
+	}
+	found := false
+	for _, inc := range params.Include {
+		if inc == responses.ResponseIncludableReasoningEncryptedContent {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Include = %v, want it to contain reasoning.encrypted_content", params.Include)
 	}
 }
 
@@ -236,7 +341,7 @@ func TestConvertResponse_PhaseMetadata(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -278,7 +383,7 @@ func TestConvertResponse_NoPhase(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -326,4 +431,25 @@ func TestConvertUsageMetadata(t *testing.T) {
 			t.Errorf("got = %#v, want nil", got)
 		}
 	})
+}
+
+// Conversion failures in the generation config must propagate out of
+// buildResponseParams instead of being swallowed, so callers see the broken
+// tool definition immediately.
+func TestBuildResponseParams_InvalidToolPropagates(t *testing.T) {
+	m := New(Config{APIKey: "test", ModelName: "gpt-5.5"})
+	req := &model.LLMRequest{
+		Config: &genai.GenerateContentConfig{
+			Tools: []*genai.Tool{{
+				FunctionDeclarations: []*genai.FunctionDeclaration{{
+					Name:                 "broken",
+					ParametersJsonSchema: make(chan int),
+				}},
+			}},
+		},
+	}
+
+	if _, err := m.buildResponseParams(req); err == nil {
+		t.Fatalf("buildResponseParams() error = nil, want tool conversion error")
+	}
 }

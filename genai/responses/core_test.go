@@ -12,9 +12,8 @@
 package responses
 
 import (
-	"fmt"
+	"encoding/json"
 	"reflect"
-	"sort"
 	"testing"
 
 	"google.golang.org/genai"
@@ -107,7 +106,7 @@ func TestConvertToFunctionParams(t *testing.T) {
 			want: map[string]any{
 				"type":                 "object",
 				"additionalProperties": false,
-				"required":             []any{"prompt", "heightRatio"},
+				"required":             []any{"heightRatio", "prompt"},
 				"properties": map[string]any{
 					"prompt":      map[string]any{"type": "string"},
 					"heightRatio": map[string]any{"type": []any{"integer", "null"}},
@@ -178,36 +177,15 @@ func TestConvertToFunctionParams(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			// Results are compared verbatim: the "required" order must be
+			// deterministic (sorted), because an unstable order changes the
+			// serialized tool definition on every request and breaks OpenAI
+			// prompt-cache prefix matching.
 			got := convertToStrictFunctionParams(c.in)
-			sortRequiredFields(got)
-			sortRequiredFields(c.want)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("convertToStrictFunctionParams() = %#v\nwant %#v", got, c.want)
 			}
 		})
-	}
-}
-
-// sortRequiredFields normalises the "required" array order so map iteration
-// non-determinism does not cause test flakes.
-func sortRequiredFields(schema map[string]any) {
-	if schema == nil {
-		return
-	}
-	if req, ok := schema["required"].([]any); ok {
-		sort.Slice(req, func(i, j int) bool {
-			return fmt.Sprint(req[i]) < fmt.Sprint(req[j])
-		})
-	}
-	if props, ok := schema["properties"].(map[string]any); ok {
-		for _, v := range props {
-			if m, ok := v.(map[string]any); ok {
-				sortRequiredFields(m)
-			}
-		}
-	}
-	if items, ok := schema["items"].(map[string]any); ok {
-		sortRequiredFields(items)
 	}
 }
 
@@ -228,6 +206,37 @@ func TestConvertToStrictFunctionParams_DeepCopy(t *testing.T) {
 	}
 	if _, has := original["additionalProperties"]; has {
 		t.Errorf("original schema was mutated: has additionalProperties")
+	}
+}
+
+// The normalised schema must serialize to identical bytes on every call:
+// tool definitions are part of the prompt-cache prefix, so any instability
+// (e.g. map-iteration order leaking into the "required" array) would cause
+// a cache miss on every request.
+func TestConvertToStrictFunctionParams_Deterministic(t *testing.T) {
+	in := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"alpha": map[string]any{"type": "string"},
+			"beta":  map[string]any{"type": "integer"},
+			"gamma": map[string]any{"type": "boolean"},
+			"delta": map[string]any{"type": "number"},
+			"omega": map[string]any{"type": "string"},
+		},
+	}
+
+	first, err := json.Marshal(convertToStrictFunctionParams(in))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for range 50 {
+		next, err := json.Marshal(convertToStrictFunctionParams(in))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if string(next) != string(first) {
+			t.Fatalf("serialized schema is unstable:\nfirst = %s\n next = %s", first, next)
+		}
 	}
 }
 

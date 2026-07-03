@@ -67,6 +67,27 @@ func TestStreamAccumulatorOnlyText(t *testing.T) {
 	}
 }
 
+// Function calls completed during the stream must survive into the fallback
+// final response: losing a tool call would silently break the agent loop.
+func TestStreamAccumulatorFunctionCalls(t *testing.T) {
+	var acc streamAccumulator
+	acc.text.WriteString("calling the tool")
+	acc.functionCalls = append(acc.functionCalls, &genai.FunctionCall{
+		ID:   "call-1",
+		Name: "get_weather",
+		Args: map[string]any{"city": "Madrid"},
+	})
+
+	resp := acc.finalResponse(genai.FinishReasonStop, nil)
+	if got := len(resp.Content.Parts); got != 2 {
+		t.Fatalf("len(Parts) = %d, want 2", got)
+	}
+	fc := resp.Content.Parts[1].FunctionCall
+	if fc == nil || fc.ID != "call-1" || fc.Name != "get_weather" {
+		t.Errorf("Parts[1].FunctionCall = %+v, want id=call-1 name=get_weather", fc)
+	}
+}
+
 // TestStreamAccumulatorHasContent checks hasContent for empty and non-empty
 // accumulators.
 func TestStreamAccumulatorHasContent(t *testing.T) {
@@ -85,6 +106,12 @@ func TestStreamAccumulatorHasContent(t *testing.T) {
 	withText.text.WriteString("x")
 	if !withText.hasContent() {
 		t.Errorf("text-only accumulator hasContent() = false, want true")
+	}
+
+	var withCall streamAccumulator
+	withCall.functionCalls = append(withCall.functionCalls, &genai.FunctionCall{Name: "f"})
+	if !withCall.hasContent() {
+		t.Errorf("call-only accumulator hasContent() = false, want true")
 	}
 }
 

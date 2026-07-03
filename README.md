@@ -163,7 +163,7 @@ All clients support:
 - System instructions
 - Tool/function calling
 - Image inputs (base64)
-- Temperature, TopP, MaxOutputTokens, StopSequences
+- Temperature, TopP, MaxOutputTokens, StopSequences (the Responses API has no stop parameter, so the Responses client ignores StopSequences)
 - Extended thinking: classic budget API (`ThinkingBudgetTokens`) and adaptive effort API (`ThinkingEffort` + `ThinkingMode`)
 - Usage metadata
 - Custom HTTP headers (multi-value)
