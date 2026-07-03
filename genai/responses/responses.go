@@ -32,18 +32,30 @@
 // support the include parameter) are skipped on replay, since their bare IDs
 // only resolve in the context of the originating response.
 //
+// Encrypted reasoning content is bound to the credentials that produced it:
+// the API encrypts it with the organization's key, and replaying it through a
+// different provider, API key, or model fails with a 400
+// invalid_encrypted_content error. Sessions may switch channels mid-flight
+// (e.g. OpenAI to Azure fallback), so each reasoning part records the origin
+// (a fingerprint of base URL, API key, and model) and is replayed only when
+// it matches the requesting model; otherwise the encrypted content is
+// dropped and the turn degrades gracefully to fresh reasoning.
+//
 // For OpenAI-compatible gateways (Ollama, vLLM, DeepSeek, Kimi, etc.) that only
 // expose the Chat Completions endpoint, use the genai/openai package instead.
 package responses
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 
@@ -66,6 +78,10 @@ var (
 type Model struct {
 	client    *openai.Client
 	modelName string
+	// origin fingerprints the channel (base URL, API key, model) this Model
+	// talks to. Encrypted reasoning content is only replayed to the channel
+	// that produced it; see the package documentation.
+	origin string
 }
 
 // HTTPOptions holds optional HTTP-level configuration for the OpenAI client.
@@ -103,10 +119,30 @@ func New(cfg Config) *Model {
 
 	client := openai.NewClient(opts...)
 
+	apiKey := cfg.APIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+
 	return &Model{
 		client:    &client,
 		modelName: cfg.ModelName,
+		origin:    computeOrigin(cfg.BaseURL, apiKey, cfg.ModelName),
 	}
+}
+
+// computeOrigin fingerprints a channel so encrypted reasoning content is only
+// replayed to the channel that produced it. The API encrypts reasoning with
+// the organization's key, so any change of provider, API key, or model makes
+// previously captured content undecryptable (400 invalid_encrypted_content).
+// The fingerprint deliberately covers all three dimensions.
+func computeOrigin(baseURL, apiKey, modelName string) string {
+	h := sha256.New()
+	for _, s := range []string{baseURL, apiKey, modelName} {
+		h.Write([]byte(s))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // Name returns the model name.
@@ -138,7 +174,7 @@ func (m *Model) generate(ctx context.Context, req *model.LLMRequest) iter.Seq2[*
 			return
 		}
 
-		llmResp, err := convertResponse(resp)
+		llmResp, err := convertResponse(resp, m.origin)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -210,7 +246,7 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 
 			case "response.completed", "response.incomplete":
 				resp := &event.Response
-				llmResp, err := convertResponse(resp)
+				llmResp, err := convertResponse(resp, m.origin)
 				if err != nil || hasNoContent(llmResp) {
 					// The terminal event carried no aggregated output: rebuild the
 					// final response from the accumulated deltas, otherwise ADK
@@ -319,7 +355,7 @@ func (m *Model) buildResponseParams(req *model.LLMRequest) (responses.ResponseNe
 	// Conversation history → input items
 	var input responses.ResponseInputParam
 	for _, content := range req.Contents {
-		items, err := convertContentToInputItems(content)
+		items, err := convertContentToInputItems(content, m.origin)
 		if err != nil {
 			return responses.ResponseNewParams{}, err
 		}
@@ -420,13 +456,30 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 
 // convertContentToInputItems converts a genai.Content into Responses API input items.
 // A single Content may produce multiple items: text/media coalesce into a message,
-// while FunctionCall and FunctionResponse become separate typed items.
-func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInputItemUnionParam, error) {
+// while FunctionCall and FunctionResponse become separate typed items. origin
+// identifies the requesting channel: encrypted reasoning is only replayed when
+// it was captured from the same origin.
+func convertContentToInputItems(content *genai.Content, origin string) ([]responses.ResponseInputItemUnionParam, error) {
 	var items []responses.ResponseInputItemUnionParam
 	var textParts []string
 	var mediaParts []responses.ResponseInputContentUnionParam
 	var phase string
 	role := convertRole(content.Role)
+
+	// A replayed reasoning item must be followed by another item from the
+	// same turn (message or function call), or the API rejects it as
+	// dangling. Track the last part that produces such an item so trailing
+	// thoughts (e.g. from an interrupted turn) are not replayed.
+	lastFollower := -1
+	for i, part := range content.Parts {
+		if part.Thought {
+			continue
+		}
+		if part.FunctionCall != nil || part.FunctionResponse != nil ||
+			part.Text != "" || part.InlineData != nil || part.FileData != nil {
+			lastFollower = i
+		}
+	}
 
 	flushMessage := func() {
 		if len(textParts) == 0 && len(mediaParts) == 0 {
@@ -470,7 +523,7 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 		phase = ""
 	}
 
-	for _, part := range content.Parts {
+	for i, part := range content.Parts {
 		switch {
 		case part.FunctionResponse != nil:
 			flushMessage()
@@ -496,13 +549,32 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 			// Reasoning items carrying encrypted content are replayed so the
 			// model keeps its chain of thought across turns; reasoning models
 			// require the reasoning item preceding a function_call to be
-			// present in the input. Items without encrypted content (e.g.
-			// from gateways that ignore the include parameter) are skipped:
-			// their bare IDs only resolve in the context of the originating
-			// response and replaying them causes a 400 "Item not found".
+			// present in the input. Skipped instead of replayed when:
+			//   - the content is not an assistant turn: in multi-agent
+			//     histories another agent's output (thoughts included) shows
+			//     up under other roles, where a reasoning item is invalid;
+			//   - there is no encrypted content (e.g. gateways that ignore
+			//     the include parameter): bare IDs only resolve in the
+			//     originating response and replaying them is a 400;
+			//   - the origin does not match: encrypted content is bound to
+			//     the provider/API key/model that produced it, and replaying
+			//     it elsewhere is a 400 invalid_encrypted_content;
+			//   - no item from the same turn follows: the API rejects
+			//     dangling reasoning items.
+			// Skipping degrades gracefully: the model re-derives its
+			// reasoning for the turn instead of the request failing.
+			if role != responses.EasyInputMessageRoleAssistant {
+				continue
+			}
 			enc, _ := part.PartMetadata["encrypted_content"].(string)
 			id, _ := part.PartMetadata["reasoning_id"].(string)
 			if enc == "" || id == "" {
+				continue
+			}
+			if partOrigin, _ := part.PartMetadata["reasoning_origin"].(string); origin == "" || partOrigin != origin {
+				continue
+			}
+			if i > lastFollower {
 				continue
 			}
 			flushMessage()
@@ -548,7 +620,10 @@ func convertContentToInputItems(content *genai.Content) ([]responses.ResponseInp
 }
 
 // convertResponse transforms a Responses API response into an LLMResponse.
-func convertResponse(resp *responses.Response) (*model.LLMResponse, error) {
+// origin identifies the channel that produced the response; it is recorded
+// alongside encrypted reasoning content so replay can be restricted to the
+// same channel.
+func convertResponse(resp *responses.Response, origin string) (*model.LLMResponse, error) {
 	if len(resp.Output) == 0 {
 		return nil, ErrNoOutputInResponse
 	}
@@ -576,6 +651,7 @@ func convertResponse(resp *responses.Response) (*model.LLMResponse, error) {
 			meta := map[string]any{"reasoning_id": item.ID}
 			if item.EncryptedContent != "" {
 				meta["encrypted_content"] = item.EncryptedContent
+				meta["reasoning_origin"] = origin
 			}
 			content.Parts = append(content.Parts, &genai.Part{
 				Text:         joinTexts(summaryTexts),

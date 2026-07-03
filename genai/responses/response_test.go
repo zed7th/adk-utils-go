@@ -29,7 +29,7 @@ import (
 
 func TestConvertResponse_EmptyOutput(t *testing.T) {
 	resp := &responses.Response{}
-	_, err := convertResponse(resp)
+	_, err := convertResponse(resp, "test-origin")
 	if !errors.Is(err, ErrNoOutputInResponse) {
 		t.Errorf("err = %v, want %v", err, ErrNoOutputInResponse)
 	}
@@ -56,7 +56,7 @@ func TestConvertResponse_TextOnly(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestConvertResponse_ToolCall(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestConvertResponse_TextPlusToolCall(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestConvertResponse_WithReasoning(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestConvertResponse_EncryptedReasoningWithoutSummary(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -259,6 +259,37 @@ func TestConvertResponse_EncryptedReasoningWithoutSummary(t *testing.T) {
 	pm := thought.PartMetadata
 	if pm == nil || pm["reasoning_id"] != "rs-1" || pm["encrypted_content"] != "enc-blob" {
 		t.Errorf("PartMetadata = %v, want reasoning_id=rs-1 and encrypted_content=enc-blob", pm)
+	}
+	// The origin must be recorded so replay is restricted to the channel
+	// that produced the encrypted content.
+	if pm["reasoning_origin"] != "test-origin" {
+		t.Errorf("reasoning_origin = %v, want test-origin", pm["reasoning_origin"])
+	}
+}
+
+// The origin fingerprint gates encrypted-reasoning replay to the channel
+// that produced it: it must be stable for identical configs and change when
+// any of base URL, API key, or model changes.
+func TestComputeOrigin(t *testing.T) {
+	base := computeOrigin("https://api.openai.com/v1", "sk-a", "gpt-5.5")
+
+	if computeOrigin("https://api.openai.com/v1", "sk-a", "gpt-5.5") != base {
+		t.Errorf("origin is not stable for identical inputs")
+	}
+	variants := map[string]string{
+		"base URL": computeOrigin("https://azure.example.com/v1", "sk-a", "gpt-5.5"),
+		"API key":  computeOrigin("https://api.openai.com/v1", "sk-b", "gpt-5.5"),
+		"model":    computeOrigin("https://api.openai.com/v1", "sk-a", "gpt-5.6"),
+	}
+	for dim, got := range variants {
+		if got == base {
+			t.Errorf("origin did not change when %s changed", dim)
+		}
+	}
+	// Field boundaries must be unambiguous: shifting a character across the
+	// URL/key boundary must not collide.
+	if computeOrigin("ab", "c", "m") == computeOrigin("a", "bc", "m") {
+		t.Errorf("origin collides across field boundaries")
 	}
 }
 
@@ -310,7 +341,7 @@ func TestConvertResponse_PhaseMetadata(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}
@@ -352,7 +383,7 @@ func TestConvertResponse_NoPhase(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	got, err := convertResponse(&resp)
+	got, err := convertResponse(&resp, "test-origin")
 	if err != nil {
 		t.Fatalf("convertResponse: %v", err)
 	}

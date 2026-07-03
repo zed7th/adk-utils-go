@@ -150,7 +150,7 @@ func TestConvertContentToInputItems(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := convertContentToInputItems(c.content)
+			got, err := convertContentToInputItems(c.content, "test-origin")
 			if err != nil {
 				t.Fatalf("convertContentToInputItems error: %v", err)
 			}
@@ -178,7 +178,7 @@ func TestConvertContentToInputItems_PhasePreserved(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content)
+	items, err := convertContentToInputItems(content, "test-origin")
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestConvertContentToInputItems_ThoughtPartsWithoutEncryptedContentSkipped(t
 		},
 	}
 
-	items, err := convertContentToInputItems(content)
+	items, err := convertContentToInputItems(content, "test-origin")
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -235,13 +235,14 @@ func TestConvertContentToInputItems_ThoughtPartsWithEncryptedContentReplayed(t *
 				PartMetadata: map[string]any{
 					"reasoning_id":      "rs-1",
 					"encrypted_content": "enc-blob",
+					"reasoning_origin":  "test-origin",
 				},
 			},
 			{FunctionCall: &genai.FunctionCall{ID: "call-1", Name: "get_weather"}},
 		},
 	}
 
-	items, err := convertContentToInputItems(content)
+	items, err := convertContentToInputItems(content, "test-origin")
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -277,13 +278,14 @@ func TestConvertContentToInputItems_EncryptedThoughtWithoutSummary(t *testing.T)
 				PartMetadata: map[string]any{
 					"reasoning_id":      "rs-2",
 					"encrypted_content": "enc-blob-2",
+					"reasoning_origin":  "test-origin",
 				},
 			},
 			{Text: "The answer."},
 		},
 	}
 
-	items, err := convertContentToInputItems(content)
+	items, err := convertContentToInputItems(content, "test-origin")
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -299,6 +301,126 @@ func TestConvertContentToInputItems_EncryptedThoughtWithoutSummary(t *testing.T)
 	}
 }
 
+// Encrypted reasoning content is bound to the provider/API key/model that
+// produced it; replaying it through another channel fails with a 400
+// invalid_encrypted_content. Thoughts whose recorded origin does not match
+// the requesting channel must be skipped instead of replayed.
+func TestConvertContentToInputItems_EncryptedThoughtFromOtherOriginSkipped(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text:    "Let me think.",
+				Thought: true,
+				PartMetadata: map[string]any{
+					"reasoning_id":      "rs-1",
+					"encrypted_content": "enc-blob",
+					"reasoning_origin":  "azure-origin",
+				},
+			},
+			{Text: "The answer."},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "openai-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item (foreign thought skipped), got %d", len(items))
+	}
+	if items[0].OfMessage == nil {
+		t.Fatalf("item should be message, got %+v", items[0])
+	}
+}
+
+// Thought parts recorded before origin tracking existed have encrypted
+// content but no reasoning_origin; they must be skipped, not replayed on
+// the assumption they match.
+func TestConvertContentToInputItems_EncryptedThoughtWithoutOriginSkipped(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Thought: true,
+				PartMetadata: map[string]any{
+					"reasoning_id":      "rs-1",
+					"encrypted_content": "enc-blob",
+				},
+			},
+			{Text: "The answer."},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item (origin-less thought skipped), got %d", len(items))
+	}
+}
+
+// In multi-agent histories another agent's output (thoughts included) shows
+// up under non-assistant roles, where a reasoning item is invalid input.
+// Thought parts outside assistant turns must never be replayed.
+func TestConvertContentToInputItems_ThoughtInUserTurnSkipped(t *testing.T) {
+	content := &genai.Content{
+		Role: "user",
+		Parts: []*genai.Part{
+			{
+				Text:    "Copied agent reasoning.",
+				Thought: true,
+				PartMetadata: map[string]any{
+					"reasoning_id":      "rs-1",
+					"encrypted_content": "enc-blob",
+					"reasoning_origin":  "test-origin",
+				},
+			},
+			{Text: "User question."},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item (thought in user turn skipped), got %d", len(items))
+	}
+	if items[0].OfMessage == nil {
+		t.Fatalf("item should be message, got %+v", items[0])
+	}
+}
+
+// A replayed reasoning item must be followed by another item from the same
+// turn or the API rejects it as dangling. A trailing thought (e.g. from an
+// interrupted turn) must be skipped.
+func TestConvertContentToInputItems_TrailingThoughtSkipped(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text:    "Thinking, then the turn was cut short.",
+				Thought: true,
+				PartMetadata: map[string]any{
+					"reasoning_id":      "rs-1",
+					"encrypted_content": "enc-blob",
+					"reasoning_origin":  "test-origin",
+				},
+			},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items (dangling thought skipped), got %d", len(items))
+	}
+}
+
 // Model output without phase should use the simpler EasyInputMessage path.
 func TestConvertContentToInputItems_NoPhaseFallback(t *testing.T) {
 	content := &genai.Content{
@@ -306,7 +428,7 @@ func TestConvertContentToInputItems_NoPhaseFallback(t *testing.T) {
 		Parts: []*genai.Part{{Text: "plain response"}},
 	}
 
-	items, err := convertContentToInputItems(content)
+	items, err := convertContentToInputItems(content, "test-origin")
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
