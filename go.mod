@@ -7,7 +7,7 @@ require (
 	github.com/anthropics/anthropic-sdk-go v1.19.0
 	github.com/getkin/kin-openapi v0.140.0
 	github.com/lib/pq v1.10.9
-	github.com/openai/openai-go/v3 v3.16.0
+	github.com/openai/openai-go/v3 v3.36.0
 	github.com/pb33f/libopenapi v0.38.4
 	github.com/pb33f/libopenapi-validator v0.13.13
 	github.com/redis/go-redis/v9 v9.17.2
