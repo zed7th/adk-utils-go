@@ -224,6 +224,21 @@ doesn't report an all-zero usage block (e.g. Ollama not returning usage).
 Both `FunctionCall.Args` and `FunctionResponse.Response` go through
 `common.MarshalToolPayload`.
 
+### O8 - Cached prompt tokens map to `CachedContentTokenCount`
+
+OpenAI Chat Completions reports cache hits in
+`PromptTokensDetails.CachedTokens`. The count is a subset of `PromptTokens`, not
+an additional token bucket. `convertUsageMetadata` maps it to genai's
+`CachedContentTokenCount` while leaving `PromptTokenCount` and `TotalTokenCount`
+inclusive and unchanged.
+
+- **Why:** ADK's OpenTelemetry instrumentation emits
+  `gen_ai.usage.cache_read.input_tokens` from this field. Cost-aware consumers
+  can then apply the provider's discounted cache-read rate without changing the
+  total context usage.
+- **Missing details:** compatible providers that omit the field leave it at
+  zero; genai's `omitempty` keeps the detail absent on serialisation.
+
 ---
 
 ## Anthropic adapter (`genai/anthropic`)
