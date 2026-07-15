@@ -162,11 +162,13 @@ All clients support:
 - Streaming and non-streaming responses
 - System instructions
 - Tool/function calling
-- Image inputs (base64)
+- Image inputs: inline bytes (`InlineData`, sent as base64) or remote URLs (`FileData`, passed through to the provider's image-URL field — nothing is downloaded or re-encoded)
 - Temperature, TopP, MaxOutputTokens, StopSequences (the Responses API has no stop parameter, so the Responses client ignores StopSequences)
 - Extended thinking: classic budget API (`ThinkingBudgetTokens`) and adaptive effort API (`ThinkingEffort` + `ThinkingMode`)
 - Usage metadata
 - Custom HTTP headers (multi-value)
+
+Remote image URLs (`genai.Part.FileData`) are supported for image MIME types only — audio and documents still require uploaded bytes via `InlineData`. The URI must be `http(s)`: plain `http` is allowed because the clients also serve API-compatible gateways (Ollama, vLLM, LiteLLM, ...) that commonly fetch from local http endpoints, while `anthropic.com` itself only fetches publicly accessible `https` URLs and enforces that server-side. Invalid schemes and non-image MIME types fail with a clear error instead of being silently dropped.
 
 Reasoning is exposed differently per provider: Anthropic uses a token budget (`ThinkingBudgetTokens`), while the OpenAI Responses client uses a reasoning effort level (`low` / `medium` / `high`). The OpenAI Responses client additionally supports structured output via JSON Schema.
 
