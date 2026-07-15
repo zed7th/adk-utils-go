@@ -136,9 +136,10 @@ func TestConvertInlineDataToPart(t *testing.T) {
 }
 
 // convertFileDataToPart passes a remote image URL straight through to
-// ResponseInputImageParam. Only image MIME types are supported; everything else
-// (and a nil input) must return an error, because the Responses API only accepts
-// a URL for images while files require uploaded bytes.
+// ResponseInputImageParam. Only image MIME types are supported and the URI must
+// be http(s) — plain http is allowed for API-compatible gateways; everything
+// else (and a nil input) must return an error, because the Responses API only
+// accepts a URL for images while files require uploaded bytes.
 func TestConvertFileDataToPart(t *testing.T) {
 	const fileURI = "https://cdn.example.com/cat.png"
 
@@ -150,8 +151,13 @@ func TestConvertFileDataToPart(t *testing.T) {
 		{"png image", &genai.FileData{MIMEType: "image/png", FileURI: fileURI}, "image"},
 		{"jpeg image", &genai.FileData{MIMEType: "image/jpeg", FileURI: fileURI}, "image"},
 		{"webp image", &genai.FileData{MIMEType: "image/webp", FileURI: fileURI}, "image"},
+		{"plain http allowed for gateways", &genai.FileData{MIMEType: "image/png", FileURI: "http://localhost:8080/cat.png"}, "image"},
 		{"pdf unsupported", &genai.FileData{MIMEType: "application/pdf", FileURI: fileURI}, "error"},
 		{"unsupported", &genai.FileData{MIMEType: "video/mp4", FileURI: fileURI}, "error"},
+		{"empty MIME type rejected", &genai.FileData{MIMEType: "", FileURI: fileURI}, "error"},
+		{"gs scheme rejected", &genai.FileData{MIMEType: "image/png", FileURI: "gs://bucket/cat.png"}, "error"},
+		{"data URI rejected (use InlineData)", &genai.FileData{MIMEType: "image/png", FileURI: "data:image/png;base64,AAAA"}, "error"},
+		{"empty URI rejected", &genai.FileData{MIMEType: "image/png", FileURI: ""}, "error"},
 		{"nil file data", nil, "error"},
 	}
 
@@ -171,8 +177,8 @@ func TestConvertFileDataToPart(t *testing.T) {
 			if got.OfInputImage == nil {
 				t.Fatalf("expected OfInputImage, got %+v", got)
 			}
-			if url := got.OfInputImage.ImageURL.Value; url != fileURI {
-				t.Errorf("ImageURL = %q, want the raw file URI %q", url, fileURI)
+			if url := got.OfInputImage.ImageURL.Value; url != c.data.FileURI {
+				t.Errorf("ImageURL = %q, want the raw file URI %q", url, c.data.FileURI)
 			}
 		})
 	}

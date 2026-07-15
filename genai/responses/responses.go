@@ -801,12 +801,19 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 }
 
 // convertFileDataToPart converts URL-referenced file data to a Responses API content part.
-// Only images are supported: the Responses API accepts a remote URL for input_image,
-// whereas file inputs require the bytes to be uploaded first.
-// Returns an error for unsupported MIME types, mirroring convertInlineDataToPart.
+// The FileURI is passed through verbatim to input_image — nothing is downloaded or
+// base64-encoded. Only images are supported: the Responses API accepts a remote URL
+// for input_image, whereas file inputs require the bytes to be uploaded first (use
+// InlineData for those). Plain http URLs are allowed because API-compatible gateways
+// commonly fetch from local http endpoints; other schemes are rejected with a clear
+// error instead of a provider-side 400. Unsupported MIME types return an error,
+// matching convertInlineDataToPart's fail-loud behaviour.
 func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputContentUnionParam, error) {
 	if data == nil {
 		return nil, fmt.Errorf("file data is nil")
+	}
+	if !strings.HasPrefix(data.FileURI, "https://") && !strings.HasPrefix(data.FileURI, "http://") {
+		return nil, fmt.Errorf("file data URI must be an http(s) URL for the Responses API, got %q", data.FileURI)
 	}
 
 	switch data.MIMEType {
