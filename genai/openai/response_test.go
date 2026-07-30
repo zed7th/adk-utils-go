@@ -253,12 +253,12 @@ func TestConvertThinkingLevel(t *testing.T) {
 // from the raw JSON envelope that openai-go preserves on every typed
 // response struct. The function exists because OpenAI-compatible providers
 // (Kimi K2.6, DeepSeek-R1, Qwen3-Thinking, etc.) extend the Chat Completions
-// schema with this field, and openai-go does NOT type it — it lives only in
+// schema with this field, and openai-go does NOT type it - it lives only in
 // JSON.raw / ExtraFields.
 //
 // The contract is: return the field value verbatim if present and non-empty,
 // "" otherwise. Malformed JSON must yield "" rather than an error because
-// callers cannot meaningfully react to it — at the response-conversion
+// callers cannot meaningfully react to it - at the response-conversion
 // layer, dropping a thought Part is the safe degradation.
 func TestExtractReasoningContent(t *testing.T) {
 	cases := []struct {
@@ -315,7 +315,7 @@ func TestExtractReasoningContent(t *testing.T) {
 // Tests below build the response via json.Unmarshal because openai-go
 // stores the raw JSON envelope in an unexported `JSON.raw` field, populated
 // only by the generated UnmarshalJSON. Constructing the struct literally
-// would leave RawJSON() empty and bypass the field we are testing — a
+// would leave RawJSON() empty and bypass the field we are testing - a
 // false-positive trap that would let a regression slip through.
 func TestConvertResponse_WithReasoningContent(t *testing.T) {
 	t.Run("reasoning_content yields a leading Thought part", func(t *testing.T) {
@@ -403,7 +403,7 @@ func TestConvertResponse_WithReasoningContent(t *testing.T) {
 	t.Run("reasoning_content coexists with a tool call", func(t *testing.T) {
 		// The combined case matters because reasoning models often emit
 		// chain-of-thought *and* a tool call in the same turn. The Part
-		// order must be: thought → text → function call, reflecting the
+		// order must be: thought -> text -> function call, reflecting the
 		// temporal order the model produced them.
 		raw := []byte(`{
             "id": "chatcmpl-z",
@@ -415,7 +415,7 @@ func TestConvertResponse_WithReasoningContent(t *testing.T) {
                 "message": {
                     "role": "assistant",
                     "content": "Looking up weather.",
-                    "reasoning_content": "Need fresh data — call the weather tool.",
+                    "reasoning_content": "Need fresh data - call the weather tool.",
                     "tool_calls": [{
                         "id": "call_1",
                         "type": "function",
@@ -505,20 +505,21 @@ func TestBuildStreamFinalResponse_WithReasoningContent(t *testing.T) {
 	})
 }
 
-// convertUsageMetadata must map CompletionTokensDetails.ReasoningTokens to
-// ThoughtsTokenCount. This is the only path through which billing/usage
-// systems downstream (e.g. Langfuse) can see how many hidden reasoning
-// tokens a turn consumed. Dropping the field silently — as the previous
-// implementation did — makes cost dashboards under-count and removes the
-// only signal callers have that a reasoning model actually reasoned.
-func TestConvertUsageMetadata_WithReasoningTokens(t *testing.T) {
-	t.Run("reasoning tokens map to ThoughtsTokenCount", func(t *testing.T) {
+// convertUsageMetadata must preserve the provider's detailed token buckets.
+// This is the only path through which billing/usage systems downstream (e.g.
+// Langfuse) can apply reasoning-output and cache-read prices. Dropping either
+// field silently makes cost dashboards inaccurate.
+func TestConvertUsageMetadata_WithTokenDetails(t *testing.T) {
+	t.Run("reasoning and cached tokens map to genai details", func(t *testing.T) {
 		usage := openai.CompletionUsage{
 			PromptTokens:     10,
 			CompletionTokens: 50,
 			TotalTokens:      60,
 			CompletionTokensDetails: openai.CompletionUsageCompletionTokensDetails{
 				ReasoningTokens: 42,
+			},
+			PromptTokensDetails: openai.CompletionUsagePromptTokensDetails{
+				CachedTokens: 8,
 			},
 		}
 		got := convertUsageMetadata(usage)
@@ -528,6 +529,9 @@ func TestConvertUsageMetadata_WithReasoningTokens(t *testing.T) {
 		if got.ThoughtsTokenCount != 42 {
 			t.Errorf("ThoughtsTokenCount = %d, want 42", got.ThoughtsTokenCount)
 		}
+		if got.CachedContentTokenCount != 8 {
+			t.Errorf("CachedContentTokenCount = %d, want 8", got.CachedContentTokenCount)
+		}
 		// Ensure the rest of the mapping is unchanged: a regression that
 		// rewrites the field assignments could silently zero one of these.
 		if got.PromptTokenCount != 10 || got.CandidatesTokenCount != 50 || got.TotalTokenCount != 60 {
@@ -535,11 +539,11 @@ func TestConvertUsageMetadata_WithReasoningTokens(t *testing.T) {
 		}
 	})
 
-	t.Run("zero reasoning tokens emit zero ThoughtsTokenCount", func(t *testing.T) {
+	t.Run("missing details emit zero detail counts", func(t *testing.T) {
 		// Providers that don't emit CompletionTokensDetails (Ollama,
-		// vanilla GPT-4o) must keep ThoughtsTokenCount=0. genai's
-		// `omitempty` then drops the field on serialisation so the
-		// observability backends don't see a misleading zero metric.
+		// vanilla GPT-4o) must keep detail counts at zero. genai's
+		// `omitempty` then drops the fields on serialisation so the
+		// observability backends don't see misleading zero metrics.
 		usage := openai.CompletionUsage{
 			PromptTokens:     1,
 			CompletionTokens: 2,
@@ -551,6 +555,9 @@ func TestConvertUsageMetadata_WithReasoningTokens(t *testing.T) {
 		}
 		if got.ThoughtsTokenCount != 0 {
 			t.Errorf("ThoughtsTokenCount = %d, want 0", got.ThoughtsTokenCount)
+		}
+		if got.CachedContentTokenCount != 0 {
+			t.Errorf("CachedContentTokenCount = %d, want 0", got.CachedContentTokenCount)
 		}
 	})
 }

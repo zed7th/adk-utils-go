@@ -134,7 +134,7 @@ equivalent, working outputs.
 - **What is allowed to differ:** constructor/config surface, caching, billing/
   auth transport, provider-only features (reasoning blocks). These are opt-in at
   construction time and don't change the `model.LLM` runtime contract.
-- **Why:** consumers (baifo, Magec, …) pick a provider by config and expect the
+- **Why:** consumers (baifo, Magec, ...) pick a provider by config and expect the
   agent to "just work". A divergence where "this provider does X and the other
   does Y and that's why it breaks" is a bug in *this* library, not the
   consumer's problem. Every cross-provider decision above (D1-D4) exists to hold
@@ -223,6 +223,53 @@ doesn't report an all-zero usage block (e.g. Ollama not returning usage).
 
 Both `FunctionCall.Args` and `FunctionResponse.Response` go through
 `common.MarshalToolPayload`.
+
+### O8 - Streaming requests always set `stream_options.include_usage=true`
+
+OpenAI's Chat Completions API only emits a final usage chunk on the SSE stream
+when the caller opts in via `stream_options.include_usage`. Without it, the
+`ChatCompletionAccumulator`'s `Usage` stays zero, and `buildStreamFinalResponse`
+already reads that accumulator (`convertUsageMetadata(acc.Usage)`) into the
+terminal `LLMResponse`'s `UsageMetadata`: so the plumbing was there, but the
+opt-in was missing.
+
+- **Decision:** `generateStream` sets `params.StreamOptions.IncludeUsage =
+  param.NewOpt(true)` before `NewStreaming`. The final `LLMResponse` on the
+  streaming path now carries populated `UsageMetadata`, matching the non-
+  streaming path (`generate` -> `convertResponse`).
+- **Why:** consumers that price token spend (Langfuse, billing dashboards)
+  need usage on **every** turn, not just the non-streaming ones. Forcing
+  callers to pick between streaming UX and usage accounting turned the
+  adapter into an all-or-nothing choice.
+- **Symmetry with the non-streaming path:** `generate` returns usage via
+  `convertResponse(resp.Usage)`. Under D5 the two paths must be
+  behaviourally interchangeable; the include-usage opt-in restores that.
+- **Providers without the field:** Ollama and other OpenAI-compat servers
+  that don't implement `stream_options.include_usage` ignore it (see the
+  documented server behaviour), and O6 still drops the resulting all-zero
+  usage block. No behaviour change for those.
+- **Interrupted streams:** OpenAI's docs note that a broken stream may drop
+  the terminal usage chunk. That surfaces as an accumulator with zero usage
+  and O6 drops it: consistent with the pre-change behaviour on those failed
+  turns.
+- **Tests:** `wire_test.go::TestWireBody_StreamRequestsUsage` fires one
+  streaming request through the wire-capture fixture and asserts the JSON
+  body has `stream: true` and `stream_options.include_usage: true`.
+
+### O9 - Cached prompt tokens map to `CachedContentTokenCount`
+
+OpenAI Chat Completions reports cache hits in
+`PromptTokensDetails.CachedTokens`. The count is a subset of `PromptTokens`, not
+an additional token bucket. `convertUsageMetadata` maps it to genai's
+`CachedContentTokenCount` while leaving `PromptTokenCount` and `TotalTokenCount`
+inclusive and unchanged.
+
+- **Why:** ADK's OpenTelemetry instrumentation emits
+  `gen_ai.usage.cache_read.input_tokens` from this field. Cost-aware consumers
+  can then apply the provider's discounted cache-read rate without changing the
+  total context usage.
+- **Missing details:** compatible providers that omit the field leave it at
+  zero; genai's `omitempty` keeps the detail absent on serialisation.
 
 ---
 
