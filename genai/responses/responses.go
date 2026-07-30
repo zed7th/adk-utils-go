@@ -54,6 +54,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"mime"
 	"net/http"
 	"os"
 	"sort"
@@ -773,7 +774,7 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 		return nil, fmt.Errorf("inline data is nil")
 	}
 
-	mediaType := data.MIMEType
+	mediaType := normalizeMIMEType(data.MIMEType)
 	base64Data := base64.StdEncoding.EncodeToString(data.Data)
 	dataURI := fmt.Sprintf("data:%s;base64,%s", mediaType, base64Data)
 
@@ -800,23 +801,26 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 	}
 }
 
-// convertFileDataToPart converts URL-referenced file data to a Responses API content part.
-// The FileURI is passed through verbatim to input_image — nothing is downloaded or
-// base64-encoded. Only images are supported: the Responses API accepts a remote URL
-// for input_image, whereas file inputs require the bytes to be uploaded first (use
-// InlineData for those). Plain http URLs are allowed because API-compatible gateways
-// commonly fetch from local http endpoints; other schemes are rejected with a clear
-// error instead of a provider-side 400. Unsupported MIME types return an error,
-// matching convertInlineDataToPart's fail-loud behaviour.
+// convertFileDataToPart maps a FileData part to an input_image content part;
+// the URI goes through verbatim, nothing is downloaded. Images only: file
+// inputs need uploaded bytes (InlineData). Plain http is allowed for
+// API-compatible gateways. Other schemes error instead of being silently
+// dropped; gs://, the scheme genai.FileData documents, gets its own message
+// pointing at InlineData. DisplayName is dropped: input_image has no field
+// for it.
 func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputContentUnionParam, error) {
 	if data == nil {
 		return nil, fmt.Errorf("file data is nil")
+	}
+	if strings.HasPrefix(data.FileURI, "gs://") {
+		return nil, fmt.Errorf("file data URI %q is a Google Cloud Storage URI, which the Responses API cannot fetch: download the bytes and use InlineData instead", data.FileURI)
 	}
 	if !strings.HasPrefix(data.FileURI, "https://") && !strings.HasPrefix(data.FileURI, "http://") {
 		return nil, fmt.Errorf("file data URI must be an http(s) URL for the Responses API, got %q", data.FileURI)
 	}
 
-	switch data.MIMEType {
+	mediaType := normalizeMIMEType(data.MIMEType)
+	switch mediaType {
 	case "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp":
 		return &responses.ResponseInputContentUnionParam{
 			OfInputImage: &responses.ResponseInputImageParam{
@@ -826,8 +830,20 @@ func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputConten
 		}, nil
 
 	default:
-		return nil, fmt.Errorf("unsupported file data MIME type for Responses API: %s", data.MIMEType)
+		return nil, fmt.Errorf("unsupported file data MIME type for Responses API: %s", mediaType)
 	}
+}
+
+// normalizeMIMEType strips parameters from a MIME string ("image/png;
+// charset=utf-8" becomes "image/png") so the converters match on the media
+// type alone. Malformed strings come back unchanged and fail the match with
+// the caller's input in the error.
+func normalizeMIMEType(mimeType string) string {
+	mediaType, _, err := mime.ParseMediaType(mimeType)
+	if err != nil {
+		return mimeType
+	}
+	return mediaType
 }
 
 // convertUsageMetadata converts Responses API usage stats to genai format.
