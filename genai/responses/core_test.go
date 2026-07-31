@@ -265,6 +265,81 @@ func TestConvertToFunctionParams(t *testing.T) {
 	}
 }
 
+// Schemas outside the strict subset must be sent as authored with
+// strict=false instead of being normalized into a different meaning.
+func TestConvertFunctionParamsStrictFallback(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         map[string]any
+		wantStrict bool
+	}{
+		{
+			name: "free-form object falls back to non-strict",
+			in: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"set": map[string]any{"type": "object", "additionalProperties": true},
+				},
+			},
+			wantStrict: false,
+		},
+		{
+			name: "array without items falls back to non-strict",
+			in: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"items": map[string]any{"type": "array"},
+				},
+			},
+			wantStrict: false,
+		},
+		{
+			name: "unsupported keyword falls back to non-strict",
+			in: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string", "minLength": float64(1)},
+				},
+			},
+			wantStrict: false,
+		},
+		{
+			name: "expressible schema stays strict",
+			in: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"kind": map[string]any{"const": "image"},
+					"tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				},
+				"required": []any{"kind"},
+			},
+			wantStrict: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, strict := convertFunctionParams(c.in)
+			if strict != c.wantStrict {
+				t.Fatalf("strict = %v, want %v", strict, c.wantStrict)
+			}
+			if got == nil {
+				t.Fatal("params = nil")
+			}
+			if !strict {
+				// Non-strict schemas must pass through as authored.
+				if !reflect.DeepEqual(got, c.in) {
+					t.Errorf("non-strict schema was altered:\ngot  %#v\nwant %#v", got, c.in)
+				}
+			} else {
+				if got["additionalProperties"] != false {
+					t.Errorf("strict schema missing additionalProperties=false: %#v", got)
+				}
+			}
+		})
+	}
+}
+
 // convertToStrictFunctionParams must deep-copy the input so callers who
 // reuse schemas across multiple tool registrations don't see mutations.
 func TestConvertToStrictFunctionParams_DeepCopy(t *testing.T) {

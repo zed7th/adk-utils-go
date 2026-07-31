@@ -745,8 +745,8 @@ func convertTools(genaiTools []*genai.Tool) ([]responses.ToolUnionParam, error) 
 				params = funcDecl.Parameters
 			}
 
-			strictParams := convertToStrictFunctionParams(params)
-			if strictParams == nil {
+			toolParams, strict := convertFunctionParams(params)
+			if toolParams == nil {
 				return nil, fmt.Errorf("parameters of tool %q cannot be converted to a JSON schema object", funcDecl.Name)
 			}
 
@@ -754,8 +754,8 @@ func convertTools(genaiTools []*genai.Tool) ([]responses.ToolUnionParam, error) 
 				OfFunction: &responses.FunctionToolParam{
 					Name:        funcDecl.Name,
 					Description: param.NewOpt(funcDecl.Description),
-					Parameters:  strictParams,
-					Strict:      param.NewOpt(true),
+					Parameters:  toolParams,
+					Strict:      param.NewOpt(strict),
 				},
 			})
 		}
@@ -903,6 +903,151 @@ func convertToStrictFunctionParams(params any) map[string]any {
 	return m
 }
 
+// convertFunctionParams prepares tool parameters for the API and decides the
+// strict flag. Schemas inside the strict subset are normalized and sent with
+// strict=true so the API constrains generation to them. Schemas the subset
+// cannot express, such as free-form objects (additionalProperties: true) or
+// arrays without an item schema, are sent as authored with strict=false:
+// forcing them through strict normalization would silently change their
+// meaning (a free-form object would harden into an empty one), and the API
+// rejects them with invalid_function_parameters if sent strict anyway.
+func convertFunctionParams(params any) (map[string]any, bool) {
+	if params == nil {
+		return convertToStrictFunctionParams(nil), true
+	}
+	m := deepCopySchema(params)
+	if m == nil {
+		return nil, false
+	}
+	lowercaseTypes(m)
+	if !fitsStrictSubset(m) {
+		return m, false
+	}
+	normalizeStrictSchema(m)
+	return m, true
+}
+
+// unsupportedStrictKeywords are schema keywords the strict subset rejects and
+// normalization cannot express or rewrite. Their presence anywhere in a tool
+// schema sends the tool as non-strict. oneOf is absent on purpose: it is
+// rewritten to anyOf during normalization.
+var unsupportedStrictKeywords = []string{
+	"allOf", "not", "if", "then", "else",
+	"dependentRequired", "dependentSchemas", "patternProperties",
+	"propertyNames", "prefixItems", "contains", "unevaluatedProperties",
+	"minLength", "maxLength",
+}
+
+// fitsStrictSubset reports whether a schema can be normalized into the strict
+// subset without changing what it accepts. It walks the same nodes as
+// normalizeStrictSchema and fails on free-form objects, arrays without an
+// item schema, nodes whose type cannot be derived, and keywords the subset
+// rejects outright.
+func fitsStrictSubset(schema map[string]any) bool {
+	for _, key := range unsupportedStrictKeywords {
+		if _, ok := schema[key]; ok {
+			return false
+		}
+	}
+
+	if ap, ok := schema["additionalProperties"]; ok && ap != false {
+		return false
+	}
+
+	if isArraySchema(schema) {
+		if _, ok := schema["items"]; !ok {
+			return false
+		}
+	}
+
+	if !hasDerivableType(schema) {
+		return false
+	}
+
+	if props, ok := schema["properties"].(map[string]any); ok {
+		for _, prop := range props {
+			if propMap, ok := prop.(map[string]any); ok && !fitsStrictSubset(propMap) {
+				return false
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]any); ok && !fitsStrictSubset(items) {
+		return false
+	}
+	if defs, ok := schema["$defs"].(map[string]any); ok {
+		for _, def := range defs {
+			if defMap, ok := def.(map[string]any); ok && !fitsStrictSubset(defMap) {
+				return false
+			}
+		}
+	}
+	for _, key := range []string{"anyOf", "oneOf"} {
+		branches, _ := schema[key].([]any)
+		for _, branch := range branches {
+			if branchMap, ok := branch.(map[string]any); ok && !fitsStrictSubset(branchMap) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// hasDerivableType reports whether a node either has a type or lets strict
+// normalization derive one: $ref and union nodes need no type of their own,
+// object and array shapes are recognized from properties/items, and literal
+// nodes derive their type from const or enum values.
+func hasDerivableType(schema map[string]any) bool {
+	if _, ok := schema["type"]; ok {
+		return true
+	}
+	if _, ok := schema["$ref"]; ok {
+		return true
+	}
+	for _, key := range []string{"anyOf", "oneOf"} {
+		if _, ok := schema[key]; ok {
+			return true
+		}
+	}
+	if isObjectSchema(schema) {
+		return true
+	}
+	if _, ok := schema["items"]; ok {
+		return true
+	}
+	if v, ok := schema["const"]; ok {
+		return literalType(v) != ""
+	}
+	if vals, ok := schema["enum"].([]any); ok && len(vals) > 0 {
+		t := literalType(vals[0])
+		if t == "" {
+			return false
+		}
+		for _, v := range vals[1:] {
+			if literalType(v) != t {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// isArraySchema reports whether the schema's type names "array", either as a
+// plain string or inside a type union list.
+func isArraySchema(schema map[string]any) bool {
+	switch t := schema["type"].(type) {
+	case string:
+		return t == "array"
+	case []any:
+		for _, v := range t {
+			if s, ok := v.(string); ok && s == "array" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // normalizeStrictSchema recursively makes a JSON schema compliant with
 // OpenAI strict mode. For every object type (whether type is "object" or
 // contains "object" in an array like ["object", "null"]) it:
@@ -935,6 +1080,11 @@ func normalizeStrictSchema(schema map[string]any) {
 		normalizeStrictSchema(items)
 	}
 	ensureTypeForLiteral(schema)
+	if _, ok := schema["type"]; !ok {
+		if _, hasItems := schema["items"]; hasItems {
+			schema["type"] = "array"
+		}
+	}
 	if defs, ok := schema["$defs"].(map[string]any); ok {
 		for _, def := range defs {
 			if defMap, ok := def.(map[string]any); ok {
