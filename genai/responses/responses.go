@@ -934,8 +934,9 @@ func convertToStrictFunctionParams(params any) map[string]any {
 //   - sets "required" to all property keys
 //   - expands originally-optional properties to nullable (["type", "null"])
 //
-// Recursion covers properties, items, $defs and anyOf branches, and oneOf
-// keys are renamed to anyOf (the strict subset rejects oneOf). Child schemas
+// Recursion covers properties, items, $defs and anyOf branches, oneOf keys
+// are renamed to anyOf (the strict subset rejects oneOf), and bare const or
+// enum nodes get their literal type filled in. Child schemas
 // are normalised before the parent marks optional fields as nullable, so
 // nested objects get their own required/additionalProperties regardless of
 // whether the parent considers them optional.
@@ -956,6 +957,7 @@ func normalizeStrictSchema(schema map[string]any) {
 	if items, ok := schema["items"].(map[string]any); ok {
 		normalizeStrictSchema(items)
 	}
+	ensureTypeForLiteral(schema)
 	if defs, ok := schema["$defs"].(map[string]any); ok {
 		for _, def := range defs {
 			if defMap, ok := def.(map[string]any); ok {
@@ -1044,6 +1046,48 @@ func isObjectType(schema map[string]any) bool {
 
 // makeNullable expands a property's type to ["<original>", "null"] so strict
 // mode accepts it as an optional (nullable) field.
+// ensureTypeForLiteral fills in a missing "type" on schemas written as a
+// bare const or enum. The API rejects such nodes with "schema must have a
+// 'type' key", and the type of a literal follows from its value, so it is
+// derived from the const or from a same-typed enum value list.
+func ensureTypeForLiteral(schema map[string]any) {
+	if _, ok := schema["type"]; ok {
+		return
+	}
+	if v, ok := schema["const"]; ok {
+		if t := literalType(v); t != "" {
+			schema["type"] = t
+		}
+		return
+	}
+	if vals, ok := schema["enum"].([]any); ok && len(vals) > 0 {
+		t := literalType(vals[0])
+		for _, v := range vals[1:] {
+			if literalType(v) != t {
+				return
+			}
+		}
+		if t != "" {
+			schema["type"] = t
+		}
+	}
+}
+
+// literalType maps a decoded JSON literal to its schema type name. An empty
+// string means the type cannot be derived (null or nested values).
+func literalType(v any) string {
+	switch v.(type) {
+	case string:
+		return "string"
+	case bool:
+		return "boolean"
+	case float64:
+		return "number"
+	default:
+		return ""
+	}
+}
+
 func makeNullable(prop any) {
 	propMap, ok := prop.(map[string]any)
 	if !ok {

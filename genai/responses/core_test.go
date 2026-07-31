@@ -174,6 +174,28 @@ func TestConvertToFunctionParams(t *testing.T) {
 			},
 		},
 		{
+			name: "bare const and enum get their literal type filled in",
+			in: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"kind":  map[string]any{"const": "image"},
+					"level": map[string]any{"enum": []any{float64(1), float64(2)}},
+					"mixed": map[string]any{"enum": []any{"a", float64(1)}},
+				},
+				"required": []any{"kind", "level", "mixed"},
+			},
+			want: map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"required":             []any{"kind", "level", "mixed"},
+				"properties": map[string]any{
+					"kind":  map[string]any{"type": "string", "const": "image"},
+					"level": map[string]any{"type": "number", "enum": []any{float64(1), float64(2)}},
+					"mixed": map[string]any{"enum": []any{"a", float64(1)}},
+				},
+			},
+		},
+		{
 			name: "$defs branches normalised and oneOf renamed to anyOf",
 			in: map[string]any{
 				"type": "object",
