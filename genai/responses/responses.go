@@ -934,9 +934,11 @@ func convertToStrictFunctionParams(params any) map[string]any {
 //   - sets "required" to all property keys
 //   - expands originally-optional properties to nullable (["type", "null"])
 //
-// Child schemas are normalised before the parent marks optional fields as
-// nullable, so nested objects get their own required/additionalProperties
-// regardless of whether the parent considers them optional.
+// Recursion covers properties, items, $defs and anyOf branches, and oneOf
+// keys are renamed to anyOf (the strict subset rejects oneOf). Child schemas
+// are normalised before the parent marks optional fields as nullable, so
+// nested objects get their own required/additionalProperties regardless of
+// whether the parent considers them optional.
 func normalizeStrictSchema(schema map[string]any) {
 	if schema == nil {
 		return
@@ -953,6 +955,33 @@ func normalizeStrictSchema(schema map[string]any) {
 	}
 	if items, ok := schema["items"].(map[string]any); ok {
 		normalizeStrictSchema(items)
+	}
+	if defs, ok := schema["$defs"].(map[string]any); ok {
+		for _, def := range defs {
+			if defMap, ok := def.(map[string]any); ok {
+				normalizeStrictSchema(defMap)
+			}
+		}
+	}
+
+	// The strict subset rejects "oneOf", so the key is renamed to anyOf.
+	// This widens validation from "exactly one branch" to "at least one
+	// branch": every payload the original schema accepted stays valid, so
+	// generation keeps following the authored branches. In the rare case
+	// where anyOf is already present the oneOf branches are dropped, as
+	// the subset has no way to express the conjunction of the two.
+	if branches, ok := schema["oneOf"].([]any); ok {
+		if _, exists := schema["anyOf"]; !exists {
+			schema["anyOf"] = branches
+		}
+		delete(schema, "oneOf")
+	}
+	if branches, ok := schema["anyOf"].([]any); ok {
+		for _, branch := range branches {
+			if branchMap, ok := branch.(map[string]any); ok {
+				normalizeStrictSchema(branchMap)
+			}
+		}
 	}
 
 	if !isObjectSchema(schema) {
@@ -1018,6 +1047,16 @@ func isObjectType(schema map[string]any) bool {
 func makeNullable(prop any) {
 	propMap, ok := prop.(map[string]any)
 	if !ok {
+		return
+	}
+	// A $ref carries no "type" to extend with "null", so nullability is
+	// expressed as an anyOf union of the reference and null instead.
+	if ref, ok := propMap["$ref"]; ok {
+		delete(propMap, "$ref")
+		propMap["anyOf"] = []any{
+			map[string]any{"$ref": ref},
+			map[string]any{"type": "null"},
+		}
 		return
 	}
 	switch t := propMap["type"].(type) {
