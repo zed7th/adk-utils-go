@@ -173,6 +173,60 @@ func TestConvertToFunctionParams(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "$defs branches normalised and oneOf renamed to anyOf",
+			in: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"item": map[string]any{"$ref": "#/$defs/item"},
+				},
+				"required": []any{"item"},
+				"$defs": map[string]any{
+					"item": map[string]any{
+						"oneOf": []any{
+							map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"text":    map[string]any{"type": "string"},
+									"caption": map[string]any{"type": "string"},
+									"source":  map[string]any{"$ref": "#/$defs/source"},
+								},
+								"required": []any{"text"},
+							},
+						},
+					},
+				},
+			},
+			want: map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"required":             []any{"item"},
+				"properties": map[string]any{
+					"item": map[string]any{"$ref": "#/$defs/item"},
+				},
+				"$defs": map[string]any{
+					"item": map[string]any{
+						"anyOf": []any{
+							map[string]any{
+								"type":                 "object",
+								"additionalProperties": false,
+								"required":             []any{"caption", "source", "text"},
+								"properties": map[string]any{
+									"text":    map[string]any{"type": "string"},
+									"caption": map[string]any{"type": []any{"string", "null"}},
+									"source": map[string]any{
+										"anyOf": []any{
+											map[string]any{"$ref": "#/$defs/source"},
+											map[string]any{"type": "null"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, c := range cases {
