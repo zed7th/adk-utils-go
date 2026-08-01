@@ -210,6 +210,9 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 		}
 
 		stream := m.client.Responses.NewStreaming(ctx, params)
+		// The iterator returns early on terminal events, so the body is
+		// closed explicitly; leaving it open leaks the connection.
+		defer stream.Close()
 
 		var acc streamAccumulator
 		for stream.Next() {
@@ -221,6 +224,23 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 					continue
 				}
 				acc.text.WriteString(event.Delta)
+				llmResp := &model.LLMResponse{
+					Content: &genai.Content{
+						Role:  genai.RoleModel,
+						Parts: []*genai.Part{{Text: event.Delta}},
+					},
+					Partial:      true,
+					TurnComplete: false,
+				}
+				if !yield(llmResp, nil) {
+					return
+				}
+
+			case "response.refusal.delta":
+				if event.Delta == "" {
+					continue
+				}
+				acc.refusal.WriteString(event.Delta)
 				llmResp := &model.LLMResponse{
 					Content: &genai.Content{
 						Role:  genai.RoleModel,
@@ -327,11 +347,13 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 // streamAccumulator collects streamed deltas so a complete final response
 // can be rebuilt when the terminal event lacks the aggregated output.
 // reasoning holds the reasoning summary; text holds the final answer;
-// functionCalls holds tool calls completed during the stream; items holds
-// the complete output items from output_item.done events.
+// refusal holds streamed refusal text; functionCalls holds tool calls
+// completed during the stream; items holds the complete output items from
+// output_item.done events.
 type streamAccumulator struct {
 	reasoning     strings.Builder
 	text          strings.Builder
+	refusal       strings.Builder
 	functionCalls []*genai.FunctionCall
 	items         []responses.ResponseOutputItemUnion
 }
@@ -339,12 +361,14 @@ type streamAccumulator struct {
 // fallbackResponse rebuilds the final turn when the terminal event lacked
 // aggregated output. Complete done items are preferred: they keep message
 // IDs, phase, status, and encrypted reasoning for the next stateless
-// replay. Bare deltas are the last resort.
+// replay. Deltas the done items did not cover are merged in, and bare
+// deltas alone are the last resort.
 func (a *streamAccumulator) fallbackResponse(resp *responses.Response, origin string) *model.LLMResponse {
 	if len(a.items) > 0 {
 		shadow := *resp
 		shadow.Output = a.items
 		if r, err := convertResponse(&shadow, origin); err == nil && !hasNoContent(r) {
+			a.fillMissingDeltas(r)
 			return r
 		}
 	}
@@ -354,10 +378,57 @@ func (a *streamAccumulator) fallbackResponse(resp *responses.Response, origin st
 	)
 }
 
+// fillMissingDeltas merges delta-accumulated content the done items did not
+// cover: a gateway may complete only some items (e.g. reasoning) while the
+// rest of the turn streamed as bare deltas, and dropping either side would
+// lose output the consumer already saw.
+func (a *streamAccumulator) fillMissingDeltas(r *model.LLMResponse) {
+	hasThought, hasText := false, false
+	for _, p := range r.Content.Parts {
+		switch {
+		case p.Thought:
+			hasThought = true
+		case p.Text != "":
+			hasText = true
+		}
+	}
+	if !hasThought && a.reasoning.Len() > 0 {
+		r.Content.Parts = append(
+			[]*genai.Part{{Text: a.reasoning.String(), Thought: true}},
+			r.Content.Parts...,
+		)
+	}
+	if !hasText && (a.text.Len() > 0 || a.refusal.Len() > 0) {
+		// Text goes before any function calls, matching the temporal
+		// order in which the parts streamed.
+		idx := len(r.Content.Parts)
+		for i, p := range r.Content.Parts {
+			if p.FunctionCall != nil {
+				idx = i
+				break
+			}
+		}
+		var fill []*genai.Part
+		if a.text.Len() > 0 {
+			fill = append(fill, &genai.Part{Text: a.text.String()})
+		}
+		if a.refusal.Len() > 0 {
+			fill = append(fill, &genai.Part{
+				Text:         a.refusal.String(),
+				PartMetadata: map[string]any{"refusal": true},
+			})
+		}
+		parts := append([]*genai.Part{}, r.Content.Parts[:idx]...)
+		parts = append(parts, fill...)
+		r.Content.Parts = append(parts, r.Content.Parts[idx:]...)
+	}
+}
+
 // hasContent reports whether anything was accumulated that could be used to
 // rebuild a final response.
 func (a *streamAccumulator) hasContent() bool {
-	return a.reasoning.Len() > 0 || a.text.Len() > 0 || len(a.functionCalls) > 0
+	return a.reasoning.Len() > 0 || a.text.Len() > 0 || a.refusal.Len() > 0 ||
+		len(a.functionCalls) > 0
 }
 
 // finalResponse builds a non-partial final response from the accumulated deltas
@@ -373,6 +444,12 @@ func (a *streamAccumulator) finalResponse(
 	}
 	if a.text.Len() > 0 {
 		content.Parts = append(content.Parts, &genai.Part{Text: a.text.String()})
+	}
+	if a.refusal.Len() > 0 {
+		content.Parts = append(content.Parts, &genai.Part{
+			Text:         a.refusal.String(),
+			PartMetadata: map[string]any{"refusal": true},
+		})
 	}
 	for _, fc := range a.functionCalls {
 		content.Parts = append(content.Parts, &genai.Part{FunctionCall: fc})
@@ -954,31 +1031,60 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 }
 
 // isDocumentMIMEType reports whether a media type is in the Responses API's
-// documented file-input family: PDF, Office, OpenDocument, iWork, and Google
-// Docs formats, plus text (plain text, markdown, HTML, CSV, source code) and
-// a few application/* text carriers (JSON, JavaScript, RFC 822 mail).
+// documented file-input list: text/ wholesale, plus the documented
+// application/ and message/ types (documents, spreadsheets, presentations,
+// and code carriers).
 func isDocumentMIMEType(mediaType string) bool {
 	if strings.HasPrefix(mediaType, "text/") {
 		return true
 	}
 	switch mediaType {
 	case "application/pdf",
-		"application/json", "application/javascript", "application/rtf",
-		"application/csv", "application/x-iif",
 		"message/rfc822",
-		"application/msword",
-		"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-		"application/vnd.ms-excel",
+		// Spreadsheets.
 		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-		"application/vnd.ms-powerpoint",
-		"application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		"application/vnd.ms-excel",
+		"application/csv",
+		"application/x-iif",
+		"application/vnd.google-apps.spreadsheet",
+		// Rich documents.
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		"application/msword",
+		"application/rtf",
 		"application/vnd.oasis.opendocument.text",
 		"application/vnd.apple.pages",
-		"application/vnd.apple.keynote",
-		"application/vnd.apple.iwork",
 		"application/vnd.google-apps.document",
-		"application/vnd.google-apps.spreadsheet",
-		"application/vnd.google-apps.presentation":
+		"application/vnd.apple.iwork",
+		// Presentations.
+		"application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		"application/vnd.ms-powerpoint",
+		"application/vnd.apple.keynote",
+		"application/vnd.google-apps.presentation",
+		// Code and structured text.
+		"application/javascript",
+		"application/typescript",
+		"application/json",
+		"application/json5",
+		"application/x-json5",
+		"application/x-ndjson",
+		"application/yaml",
+		"application/x-yaml",
+		"application/toml",
+		"application/graphql",
+		"application/x-graphql",
+		"application/x-protobuf",
+		"application/x-sql",
+		"application/x-scala",
+		"application/x-rust",
+		"application/x-php",
+		"application/x-httpd-php",
+		"application/x-httpd-php-source",
+		"application/x-powershell",
+		"application/x-bash",
+		"application/x-awk",
+		"application/x-terraform",
+		"application/x-patch",
+		"application/x-subrip":
 		return true
 	}
 	return false

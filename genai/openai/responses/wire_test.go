@@ -305,3 +305,142 @@ func TestWireBody_StreamFallbackPrefersDoneItems(t *testing.T) {
 		t.Errorf("second part = %+v, want text with message_id and phase", msg)
 	}
 }
+
+// closeTrackingBody flags when the response body is closed so tests can
+// prove the stream does not leak the connection.
+type closeTrackingBody struct {
+	io.Reader
+	closed *bool
+}
+
+func (b closeTrackingBody) Close() error {
+	*b.closed = true
+	return nil
+}
+
+type sseTransport struct {
+	payload string
+	closed  *bool
+}
+
+func (s *sseTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       closeTrackingBody{Reader: bytes.NewReader([]byte(s.payload)), closed: s.closed},
+		Request:    r,
+	}, nil
+}
+
+// The stream returns early on terminal events, so the response body must be
+// closed explicitly; leaving it open leaks the connection.
+func TestStreamBodyClosed(t *testing.T) {
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, []byte(minimalResponseJSON)); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	closed := false
+	payload := "event: response.completed\n" +
+		`data: {"type":"response.completed","sequence_number":1,"response":` + compact.String() + "}\n\n"
+	m := New(Config{
+		APIKey:      "test-key",
+		ModelName:   "gpt-test",
+		BaseURL:     "http://fake.local",
+		HTTPOptions: HTTPOptions{Client: &http.Client{Transport: &sseTransport{payload: payload, closed: &closed}}},
+	})
+
+	req := &model.LLMRequest{Contents: []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+	}}
+	for _, err := range m.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+	}
+	if !closed {
+		t.Fatalf("stream body was not closed")
+	}
+}
+
+// Done items that cover only part of the turn (e.g. reasoning) must not
+// discard text that streamed as bare deltas: the consumer already saw it,
+// so the final event and the next turn's history must keep it.
+func TestWireBody_StreamFallbackMergesUncoveredDeltas(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: response.output_text.delta\n")
+		io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"hello","sequence_number":1}`+"\n\n")
+		io.WriteString(w, "event: response.output_item.done\n")
+		io.WriteString(w, `data: {"type":"response.output_item.done","sequence_number":2,"item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"enc-blob"}}`+"\n\n")
+		io.WriteString(w, "event: response.completed\n")
+		io.WriteString(w, `data: {"type":"response.completed","sequence_number":3,"response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	m := New(Config{BaseURL: srv.URL, APIKey: "test-key", ModelName: "gpt-test"})
+
+	var final *model.LLMResponse
+	req := &model.LLMRequest{Contents: []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+	}}
+	for resp, err := range m.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+		if !resp.Partial {
+			final = resp
+		}
+	}
+	if final == nil {
+		t.Fatalf("no final response was yielded")
+	}
+	if len(final.Content.Parts) != 2 {
+		t.Fatalf("expected 2 parts (reasoning + merged text), got %d: %+v", len(final.Content.Parts), final.Content.Parts)
+	}
+	if !final.Content.Parts[0].Thought || final.Content.Parts[0].PartMetadata["encrypted_content"] != "enc-blob" {
+		t.Errorf("first part = %+v, want the reasoning item", final.Content.Parts[0])
+	}
+	if final.Content.Parts[1].Text != "hello" {
+		t.Errorf("second part = %+v, want the merged delta text", final.Content.Parts[1])
+	}
+}
+
+// Refusal deltas must be accumulated: without a terminal output or done
+// item, the fallback would otherwise persist an empty response.
+func TestWireBody_StreamRefusalDelta(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: response.refusal.delta\n")
+		io.WriteString(w, `data: {"type":"response.refusal.delta","delta":"I cannot help.","item_id":"msg_1","content_index":0,"output_index":0,"sequence_number":1}`+"\n\n")
+		io.WriteString(w, "event: response.completed\n")
+		io.WriteString(w, `data: {"type":"response.completed","sequence_number":2,"response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	m := New(Config{BaseURL: srv.URL, APIKey: "test-key", ModelName: "gpt-test"})
+
+	var final *model.LLMResponse
+	req := &model.LLMRequest{Contents: []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+	}}
+	for resp, err := range m.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+		if !resp.Partial {
+			final = resp
+		}
+	}
+	if final == nil {
+		t.Fatalf("no final response was yielded")
+	}
+	if len(final.Content.Parts) != 1 {
+		t.Fatalf("expected 1 part, got %d: %+v", len(final.Content.Parts), final.Content.Parts)
+	}
+	part := final.Content.Parts[0]
+	if part.Text != "I cannot help." || part.PartMetadata["refusal"] != true {
+		t.Errorf("part = %+v, want refusal text with refusal metadata", part)
+	}
+}
