@@ -19,7 +19,7 @@ This repository provides production-ready implementations for:
 ```
 ├── genai/            # LLM client implementations
 │   ├── openai/       # OpenAI Chat Completions client (works with Ollama, OpenRouter, etc.)
-│   ├── responses/    # OpenAI Responses API client (/v1/responses)
+│   │   └── responses/  # OpenAI Responses API client (/v1/responses)
 │   └── anthropic/    # Anthropic Claude client
 ├── session/          # Session service implementations
 │   └── redis/        # Redis session service
@@ -112,10 +112,10 @@ When streaming, the reasoning is emitted as partial content parts flagged `Thoug
 
 ### OpenAI Responses Client
 
-An adapter for the OpenAI [Responses API](https://platform.openai.com/docs/api-reference/responses) (`/v1/responses`) — the interface OpenAI recommends for new applications, with native reasoning, built-in tools, and structured output. The adapter runs the API statelessly (ADK owns the conversation state and replays the full history on each call), so it integrates exactly like the Chat Completions client:
+An adapter for the OpenAI [Responses API](https://platform.openai.com/docs/api-reference/responses) (`/v1/responses`): the interface OpenAI recommends for new applications, with native reasoning, built-in tools, and structured output. The adapter runs the API statelessly (ADK owns the conversation state and replays the full history on each call), so it integrates exactly like the Chat Completions client:
 
 ```go
-import genairesponses "github.com/achetronic/adk-utils-go/genai/responses"
+import genairesponses "github.com/achetronic/adk-utils-go/genai/openai/responses"
 
 llmModel := genairesponses.New(genairesponses.Config{
     APIKey:    os.Getenv("OPENAI_API_KEY"),
@@ -132,8 +132,8 @@ agent, _ := llmagent.New(llmagent.Config{
 
 | Adapter | When to use |
 |---|---|
-| `genai/responses` (Responses API) | OpenAI's recommended API — native reasoning items and structured output |
-| `genai/openai` (Chat Completions) | OpenAI-compatible gateways — Ollama, vLLM, DeepSeek, Kimi, etc. |
+| `genai/openai/responses` (Responses API) | OpenAI's recommended API: native reasoning items and structured output |
+| `genai/openai` (Chat Completions) | OpenAI-compatible gateways: Ollama, vLLM, DeepSeek, Kimi, etc. |
 
 Both OpenAI clients share the same `Config` fields (`APIKey`, `BaseURL`, `ModelName`, `HTTPOptions`). Reasoning is controlled per request through the ADK generation config: a `ThinkingConfig` maps to the Responses `reasoning.effort` level (`low` / `medium` / `high`) rather than a fixed token budget. Structured output is enabled by setting a response schema (JSON Schema) on the generation config.
 
