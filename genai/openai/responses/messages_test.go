@@ -439,3 +439,172 @@ func TestConvertContentToInputItems_NoPhaseFallback(t *testing.T) {
 		t.Fatalf("expected EasyInputMessage for non-phase content, got %+v", items[0])
 	}
 }
+
+// Nil tool payloads must serialise as "{}", never "null": strict
+// OpenAI-compatible parsers (Qwen on vLLM/llama.cpp) reject "null" where
+// they expect an object.
+func TestConvertContentToInputItems_NilToolPayloadsBecomeEmptyObject(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{FunctionCall: &genai.FunctionCall{ID: "call_1", Name: "ping"}},
+			{FunctionResponse: &genai.FunctionResponse{ID: "call_1", Name: "ping"}},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	if got := items[0].OfFunctionCall.Arguments; got != "{}" {
+		t.Errorf("Arguments = %q, want {}", got)
+	}
+	if got := items[1].OfFunctionCallOutput.Output.OfString.Value; got != "{}" {
+		t.Errorf("Output = %q, want {}", got)
+	}
+}
+
+// Parts from different output messages must be replayed as separate items
+// with their own ID and phase. Coalescing them would relabel commentary as
+// the final answer and drop the message identity models like gpt-5.3-codex
+// expect to see again.
+func TestConvertContentToInputItems_MessageBoundariesPreserved(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text:         "let me check",
+				PartMetadata: map[string]any{"phase": "commentary", "message_id": "msg_1"},
+			},
+			{
+				Text:         "the answer is 4",
+				PartMetadata: map[string]any{"phase": "final_answer", "message_id": "msg_2"},
+			},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	first, second := items[0].OfOutputMessage, items[1].OfOutputMessage
+	if first == nil || second == nil {
+		t.Fatalf("expected two OutputMessages, got %+v", items)
+	}
+	if first.ID != "msg_1" || second.ID != "msg_2" {
+		t.Errorf("IDs = %q, %q, want msg_1, msg_2", first.ID, second.ID)
+	}
+	if first.Phase != "commentary" || second.Phase != "final_answer" {
+		t.Errorf("phases = %q, %q, want commentary, final_answer", first.Phase, second.Phase)
+	}
+}
+
+// Parts carrying the same message_id belong to one output message and must
+// still coalesce into a single replayed item.
+func TestConvertContentToInputItems_SameMessagePartsCoalesce(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text:         "first half",
+				PartMetadata: map[string]any{"phase": "final_answer", "message_id": "msg_1"},
+			},
+			{
+				Text:         "second half",
+				PartMetadata: map[string]any{"phase": "final_answer", "message_id": "msg_1"},
+			},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	msg := items[0].OfOutputMessage
+	if msg == nil {
+		t.Fatalf("expected an OutputMessage, got %+v", items[0])
+	}
+	if len(msg.Content) != 2 {
+		t.Errorf("content parts = %d, want 2", len(msg.Content))
+	}
+}
+
+// A message ID without phase must still replay as an OutputMessage so the
+// item identity survives the stateless round trip.
+func TestConvertContentToInputItems_MessageIDWithoutPhase(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text:         "plain but identified",
+				PartMetadata: map[string]any{"message_id": "msg_9"},
+			},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	msg := items[0].OfOutputMessage
+	if msg == nil {
+		t.Fatalf("expected an OutputMessage, got %+v", items[0])
+	}
+	if msg.ID != "msg_9" {
+		t.Errorf("ID = %q, want msg_9", msg.ID)
+	}
+	if msg.Phase != "" {
+		t.Errorf("Phase = %q, want empty", msg.Phase)
+	}
+}
+
+// A refusal part must replay as a refusal content part with its message
+// status, not as completed output_text.
+func TestConvertContentToInputItems_RefusalAndStatusReplayed(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text: "I cannot help with that.",
+				PartMetadata: map[string]any{
+					"message_id": "msg_1",
+					"status":     "incomplete",
+					"refusal":    true,
+				},
+			},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	msg := items[0].OfOutputMessage
+	if msg == nil {
+		t.Fatalf("expected an OutputMessage, got %+v", items[0])
+	}
+	if msg.Status != "incomplete" {
+		t.Errorf("Status = %q, want incomplete", msg.Status)
+	}
+	if len(msg.Content) != 1 || msg.Content[0].OfRefusal == nil {
+		t.Fatalf("expected a refusal content part, got %+v", msg.Content)
+	}
+	if msg.Content[0].OfRefusal.Refusal != "I cannot help with that." {
+		t.Errorf("Refusal text = %q", msg.Content[0].OfRefusal.Refusal)
+	}
+}

@@ -844,7 +844,6 @@ func normalizeMIMEType(mimeType string) string {
 	return mediaType
 }
 
-
 // convertUsageMetadata converts OpenAI usage stats to genai format.
 //
 // ReasoningTokens (billed as output tokens by o-series, gpt-5.x and

@@ -42,7 +42,7 @@
 // dropped and the turn degrades gracefully to fresh reasoning.
 //
 // For OpenAI-compatible gateways (Ollama, vLLM, DeepSeek, Kimi, etc.) that only
-// expose the Chat Completions endpoint, use the genai/openai package instead.
+// expose the Chat Completions endpoint, use the parent openai package instead.
 package responses
 
 import (
@@ -60,6 +60,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/achetronic/adk-utils-go/genai/common"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
@@ -87,6 +88,7 @@ type Model struct {
 
 // HTTPOptions holds optional HTTP-level configuration for the OpenAI client.
 type HTTPOptions struct {
+	Client  *http.Client
 	Headers http.Header
 }
 
@@ -111,6 +113,9 @@ func New(cfg Config) *Model {
 	}
 	if cfg.BaseURL != "" {
 		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
+	}
+	if cfg.HTTPOptions.Client != nil {
+		opts = append(opts, option.WithHTTPClient(cfg.HTTPOptions.Client))
 	}
 	for k, vals := range cfg.HTTPOptions.Headers {
 		for _, v := range vals {
@@ -194,8 +199,8 @@ func (m *Model) generate(ctx context.Context, req *model.LLMRequest) iter.Seq2[*
 // from response.completed, or close the connection without any terminal event
 // at all. Relying solely on the server-provided output then yields an empty
 // final event, so the assistant turn is lost from history on reload even though
-// it streamed fine. To stay robust, the deltas are accumulated locally as a
-// fallback, mirroring the Chat Completions adapter.
+// it streamed fine. As a fallback the deltas are accumulated locally,
+// mirroring the Chat Completions adapter.
 func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
 		params, err := m.buildResponseParams(req)
@@ -205,6 +210,9 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 		}
 
 		stream := m.client.Responses.NewStreaming(ctx, params)
+		// The iterator returns early on terminal events, so the body is
+		// closed explicitly; leaving it open leaks the connection.
+		defer stream.Close()
 
 		var acc streamAccumulator
 		for stream.Next() {
@@ -216,6 +224,23 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 					continue
 				}
 				acc.text.WriteString(event.Delta)
+				llmResp := &model.LLMResponse{
+					Content: &genai.Content{
+						Role:  genai.RoleModel,
+						Parts: []*genai.Part{{Text: event.Delta}},
+					},
+					Partial:      true,
+					TurnComplete: false,
+				}
+				if !yield(llmResp, nil) {
+					return
+				}
+
+			case "response.refusal.delta":
+				if event.Delta == "" {
+					continue
+				}
+				acc.refusal.WriteString(event.Delta)
 				llmResp := &model.LLMResponse{
 					Content: &genai.Content{
 						Role:  genai.RoleModel,
@@ -250,24 +275,41 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 				// final event includes them: losing a tool call would
 				// silently break the agent loop.
 				if event.Item.Type == "function_call" {
+					args, err := parseJSONArgs(event.Item.Arguments.OfString)
+					if err != nil {
+						yield(nil, err)
+						return
+					}
 					acc.functionCalls = append(acc.functionCalls, &genai.FunctionCall{
 						ID:   event.Item.CallID,
 						Name: event.Item.Name,
-						Args: parseJSONArgs(event.Item.Arguments.OfString),
+						Args: args,
 					})
+				}
+				// Complete items are kept as well: when the terminal event
+				// lacks aggregated output they rebuild the turn with message
+				// IDs, phase, and encrypted reasoning intact, which the bare
+				// delta fallback cannot.
+				switch event.Item.Type {
+				case "message", "reasoning", "function_call":
+					acc.items = append(acc.items, event.Item)
 				}
 
 			case "response.completed", "response.incomplete":
 				resp := &event.Response
 				llmResp, err := convertResponse(resp, m.origin)
+				if err != nil && !errors.Is(err, ErrNoOutputInResponse) {
+					// A malformed terminal payload (e.g. broken function
+					// arguments) is a real error, not a missing-output case;
+					// degrading to the delta fallback would swallow it.
+					yield(nil, err)
+					return
+				}
 				if err != nil || hasNoContent(llmResp) {
 					// The terminal event carried no aggregated output: rebuild the
-					// final response from the accumulated deltas, otherwise ADK
+					// final response from what the stream delivered, otherwise ADK
 					// would persist an empty event and the turn would be lost.
-					llmResp = acc.finalResponse(
-						convertStatus(resp.Status, resp.IncompleteDetails),
-						convertUsageMetadata(resp.Usage),
-					)
+					llmResp = acc.fallbackResponse(resp, m.origin)
 				}
 				yield(llmResp, nil)
 				return
@@ -293,10 +335,11 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 
 		// The stream ended without any terminal event (some gateways just close
 		// the connection after the last delta). Synthesize the final event from
-		// the accumulated deltas so the turn is persisted and ADK does not raise
+		// what was accumulated so the turn is persisted and ADK does not raise
 		// "last event is not final".
-		if acc.hasContent() {
-			yield(acc.finalResponse(genai.FinishReasonStop, nil), nil)
+		if acc.hasContent() || len(acc.items) > 0 {
+			shadow := responses.Response{Status: responses.ResponseStatusCompleted}
+			yield(acc.fallbackResponse(&shadow, m.origin), nil)
 		}
 	}
 }
@@ -304,17 +347,88 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 // streamAccumulator collects streamed deltas so a complete final response
 // can be rebuilt when the terminal event lacks the aggregated output.
 // reasoning holds the reasoning summary; text holds the final answer;
-// functionCalls holds tool calls completed during the stream.
+// refusal holds streamed refusal text; functionCalls holds tool calls
+// completed during the stream; items holds the complete output items from
+// output_item.done events.
 type streamAccumulator struct {
 	reasoning     strings.Builder
 	text          strings.Builder
+	refusal       strings.Builder
 	functionCalls []*genai.FunctionCall
+	items         []responses.ResponseOutputItemUnion
+}
+
+// fallbackResponse rebuilds the final turn when the terminal event lacked
+// aggregated output. Complete done items are preferred: they keep message
+// IDs, phase, status, and encrypted reasoning for the next stateless
+// replay. Deltas the done items did not cover are merged in, and bare
+// deltas alone are the last resort.
+func (a *streamAccumulator) fallbackResponse(resp *responses.Response, origin string) *model.LLMResponse {
+	if len(a.items) > 0 {
+		shadow := *resp
+		shadow.Output = a.items
+		if r, err := convertResponse(&shadow, origin); err == nil && !hasNoContent(r) {
+			a.fillMissingDeltas(r)
+			return r
+		}
+	}
+	return a.finalResponse(
+		convertStatus(resp.Status, resp.IncompleteDetails),
+		convertUsageMetadata(resp.Usage),
+	)
+}
+
+// fillMissingDeltas merges delta-accumulated content the done items did not
+// cover: a gateway may complete only some items (e.g. reasoning) while the
+// rest of the turn streamed as bare deltas, and dropping either side would
+// lose output the consumer already saw.
+func (a *streamAccumulator) fillMissingDeltas(r *model.LLMResponse) {
+	hasThought, hasText := false, false
+	for _, p := range r.Content.Parts {
+		switch {
+		case p.Thought:
+			hasThought = true
+		case p.Text != "":
+			hasText = true
+		}
+	}
+	if !hasThought && a.reasoning.Len() > 0 {
+		r.Content.Parts = append(
+			[]*genai.Part{{Text: a.reasoning.String(), Thought: true}},
+			r.Content.Parts...,
+		)
+	}
+	if !hasText && (a.text.Len() > 0 || a.refusal.Len() > 0) {
+		// Text goes before any function calls, matching the temporal
+		// order in which the parts streamed.
+		idx := len(r.Content.Parts)
+		for i, p := range r.Content.Parts {
+			if p.FunctionCall != nil {
+				idx = i
+				break
+			}
+		}
+		var fill []*genai.Part
+		if a.text.Len() > 0 {
+			fill = append(fill, &genai.Part{Text: a.text.String()})
+		}
+		if a.refusal.Len() > 0 {
+			fill = append(fill, &genai.Part{
+				Text:         a.refusal.String(),
+				PartMetadata: map[string]any{"refusal": true},
+			})
+		}
+		parts := append([]*genai.Part{}, r.Content.Parts[:idx]...)
+		parts = append(parts, fill...)
+		r.Content.Parts = append(parts, r.Content.Parts[idx:]...)
+	}
 }
 
 // hasContent reports whether anything was accumulated that could be used to
 // rebuild a final response.
 func (a *streamAccumulator) hasContent() bool {
-	return a.reasoning.Len() > 0 || a.text.Len() > 0 || len(a.functionCalls) > 0
+	return a.reasoning.Len() > 0 || a.text.Len() > 0 || a.refusal.Len() > 0 ||
+		len(a.functionCalls) > 0
 }
 
 // finalResponse builds a non-partial final response from the accumulated deltas
@@ -330,6 +444,12 @@ func (a *streamAccumulator) finalResponse(
 	}
 	if a.text.Len() > 0 {
 		content.Parts = append(content.Parts, &genai.Part{Text: a.text.String()})
+	}
+	if a.refusal.Len() > 0 {
+		content.Parts = append(content.Parts, &genai.Part{
+			Text:         a.refusal.String(),
+			PartMetadata: map[string]any{"refusal": true},
+		})
 	}
 	for _, fc := range a.functionCalls {
 		content.Parts = append(content.Parts, &genai.Part{FunctionCall: fc})
@@ -363,14 +483,14 @@ func (m *Model) buildResponseParams(req *model.LLMRequest) (responses.ResponseNe
 		},
 	}
 
-	// System instruction → instructions field
+	// The system instruction maps to the instructions field.
 	if req.Config != nil && req.Config.SystemInstruction != nil {
 		if text := extractText(req.Config.SystemInstruction); text != "" {
 			params.Instructions = param.NewOpt(text)
 		}
 	}
 
-	// Conversation history → input items
+	// The conversation history maps to input items.
 	var input responses.ResponseInputParam
 	for _, content := range req.Contents {
 		items, err := convertContentToInputItems(content, m.origin)
@@ -408,8 +528,12 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 	// Reasoning (native support via Responses API)
 	if cfg.ThinkingConfig != nil {
 		params.Reasoning = shared.ReasoningParam{
-			Effort:  convertThinkingLevel(cfg.ThinkingConfig.ThinkingLevel),
-			Summary: shared.ReasoningSummaryAuto,
+			Effort: convertThinkingLevel(cfg.ThinkingConfig.ThinkingLevel),
+		}
+		// Summaries are requested only when the caller wants thoughts
+		// surfaced; encrypted reasoning replay works without them.
+		if cfg.ThinkingConfig.IncludeThoughts {
+			params.Reasoning.Summary = shared.ReasoningSummaryAuto
 		}
 	}
 
@@ -444,6 +568,30 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 		}
 	}
 
+	// A raw JSON schema (ResponseJsonSchema) goes through the same pipeline
+	// as tool parameters: strict when it fits the subset, non-strict
+	// otherwise, never silently ignored. The typed ResponseSchema wins when
+	// both are set.
+	if cfg.ResponseSchema == nil && cfg.ResponseJsonSchema != nil {
+		schemaMap, strict := convertFunctionParams(cfg.ResponseJsonSchema)
+		if schemaMap == nil {
+			return fmt.Errorf("response json schema cannot be converted to a JSON schema object")
+		}
+		// Strict response formats additionally require an object root.
+		if !isObjectSchema(schemaMap) {
+			strict = false
+		}
+		params.Text = responses.ResponseTextConfigParam{
+			Format: responses.ResponseFormatTextConfigUnionParam{
+				OfJSONSchema: &responses.ResponseFormatTextJSONSchemaConfigParam{
+					Name:   "response",
+					Schema: schemaMap,
+					Strict: param.NewOpt(strict),
+				},
+			},
+		}
+	}
+
 	// Tools
 	if len(cfg.Tools) > 0 {
 		tools, err := convertTools(cfg.Tools)
@@ -453,7 +601,7 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 		params.Tools = tools
 	}
 
-	// ToolConfig → tool_choice
+	// ToolConfig maps to tool_choice.
 	if cfg.ToolConfig != nil && cfg.ToolConfig.FunctionCallingConfig != nil {
 		fcc := cfg.ToolConfig.FunctionCallingConfig
 		switch fcc.Mode {
@@ -491,8 +639,11 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 func convertContentToInputItems(content *genai.Content, origin string) ([]responses.ResponseInputItemUnionParam, error) {
 	var items []responses.ResponseInputItemUnionParam
 	var textParts []string
+	var refusalFlags []bool
 	var mediaParts []responses.ResponseInputContentUnionParam
 	var phase string
+	var messageID string
+	var msgStatus string
 	role := convertRole(content.Role)
 
 	// A replayed reasoning item must be followed by another item from the
@@ -515,48 +666,79 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 			return
 		}
 
-		// Model output with phase metadata → build OutputMessage manually to
-		// preserve the phase field for GPT-5.3-Codex+ round-tripping.
-		if role == responses.EasyInputMessageRoleAssistant && phase != "" {
+		// Model output with a message ID or phase builds an OutputMessage
+		// manually, so the item identity survives the stateless round trip
+		// (models like gpt-5.3-codex expect phase back on every assistant
+		// message, and the API asks for output items to be replayed as-is).
+		if role == responses.EasyInputMessageRoleAssistant && (messageID != "" || phase != "") {
 			var contentParts []responses.ResponseOutputMessageContentUnionParam
-			for _, t := range textParts {
+			for i, t := range textParts {
+				if refusalFlags[i] {
+					contentParts = append(contentParts, responses.ResponseOutputMessageContentUnionParam{
+						OfRefusal: &responses.ResponseOutputRefusalParam{Refusal: t},
+					})
+					continue
+				}
 				contentParts = append(contentParts, responses.ResponseOutputMessageContentUnionParam{
 					OfOutputText: &responses.ResponseOutputTextParam{Text: t},
 				})
 			}
+			status := responses.ResponseOutputMessageStatusCompleted
+			if msgStatus != "" {
+				status = responses.ResponseOutputMessageStatus(msgStatus)
+			}
 			msg := responses.ResponseOutputMessageParam{
+				ID:      messageID,
 				Content: contentParts,
-				Status:  responses.ResponseOutputMessageStatusCompleted,
+				Status:  status,
 				Phase:   responses.ResponseOutputMessagePhase(phase),
 			}
 			items = append(items, responses.ResponseInputItemUnionParam{
 				OfOutputMessage: &msg,
 			})
 		} else if len(mediaParts) == 0 {
-			items = append(items, responses.ResponseInputItemParamOfMessage(
-				joinTexts(textParts), role,
-			))
+			// Type is set explicitly: the OpenAPI spec discriminates input
+			// union items on it, even though the endpoint tolerates its
+			// absence.
+			items = append(items, responses.ResponseInputItemUnionParam{
+				OfMessage: &responses.EasyInputMessageParam{
+					Content: responses.EasyInputMessageContentUnionParam{
+						OfString: param.NewOpt(joinTexts(textParts)),
+					},
+					Role: role,
+					Type: responses.EasyInputMessageTypeMessage,
+				},
+			})
 		} else {
 			var contentList responses.ResponseInputMessageContentListParam
 			for _, t := range textParts {
 				contentList = append(contentList, responses.ResponseInputContentParamOfInputText(t))
 			}
 			contentList = append(contentList, mediaParts...)
-			items = append(items, responses.ResponseInputItemParamOfMessage(
-				contentList, role,
-			))
+			items = append(items, responses.ResponseInputItemUnionParam{
+				OfMessage: &responses.EasyInputMessageParam{
+					Content: responses.EasyInputMessageContentUnionParam{
+						OfInputItemContentList: contentList,
+					},
+					Role: role,
+					Type: responses.EasyInputMessageTypeMessage,
+				},
+			})
 		}
 
 		textParts = nil
+		refusalFlags = nil
 		mediaParts = nil
 		phase = ""
+		messageID = ""
+		msgStatus = ""
 	}
 
 	for i, part := range content.Parts {
 		switch {
 		case part.FunctionResponse != nil:
 			flushMessage()
-			responseJSON, err := json.Marshal(part.FunctionResponse.Response)
+			responseJSON, err := common.MarshalToolPayload(part.FunctionResponse.Response)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal function response: %w", err)
 			}
@@ -566,7 +748,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 
 		case part.FunctionCall != nil:
 			flushMessage()
-			argsJSON, err := json.Marshal(part.FunctionCall.Args)
+			argsJSON, err := common.MarshalToolPayload(part.FunctionCall.Args)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal function args: %w", err)
 			}
@@ -621,11 +803,23 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 			})
 
 		case part.Text != "":
-			if part.PartMetadata != nil {
-				if p, ok := part.PartMetadata["phase"].(string); ok && p != "" {
-					phase = p
-				}
+			// Parts from different output messages must not coalesce:
+			// flushing on a message_id or phase change keeps each replayed
+			// message's identity and phase intact (models like
+			// gpt-5.3-codex expect commentary and final answer separate).
+			partID, _ := part.PartMetadata["message_id"].(string)
+			partPhase, _ := part.PartMetadata["phase"].(string)
+			if (len(textParts) > 0 || len(mediaParts) > 0) &&
+				(partID != messageID || partPhase != phase) {
+				flushMessage()
 			}
+			messageID = partID
+			phase = partPhase
+			if s, ok := part.PartMetadata["status"].(string); ok && s != "" {
+				msgStatus = s
+			}
+			refusal, _ := part.PartMetadata["refusal"].(bool)
+			refusalFlags = append(refusalFlags, refusal)
 			textParts = append(textParts, part.Text)
 
 		case part.InlineData != nil:
@@ -689,32 +883,51 @@ func convertResponse(resp *responses.Response, origin string) (*model.LLMRespons
 			})
 
 		case "message":
+			// ID, phase, status, and the refusal flag are kept per part so
+			// the message replays with its identity intact instead of
+			// degrading to plain completed output_text.
+			meta := func(refusal bool) map[string]any {
+				m := map[string]any{}
+				if item.Phase != "" {
+					m["phase"] = string(item.Phase)
+				}
+				if item.ID != "" {
+					m["message_id"] = item.ID
+				}
+				if item.Status != "" {
+					m["status"] = string(item.Status)
+				}
+				if refusal {
+					m["refusal"] = true
+				}
+				if len(m) == 0 {
+					return nil
+				}
+				return m
+			}
 			for _, cp := range item.Content {
 				switch cp.Type {
 				case "output_text":
-					part := &genai.Part{Text: cp.Text}
-					if item.Phase != "" || item.ID != "" {
-						meta := map[string]any{}
-						if item.Phase != "" {
-							meta["phase"] = string(item.Phase)
-						}
-						if item.ID != "" {
-							meta["message_id"] = item.ID
-						}
-						part.PartMetadata = meta
-					}
-					content.Parts = append(content.Parts, part)
+					content.Parts = append(content.Parts, &genai.Part{
+						Text: cp.Text, PartMetadata: meta(false),
+					})
 				case "refusal":
-					content.Parts = append(content.Parts, &genai.Part{Text: cp.Refusal})
+					content.Parts = append(content.Parts, &genai.Part{
+						Text: cp.Refusal, PartMetadata: meta(true),
+					})
 				}
 			}
 
 		case "function_call":
+			args, err := parseJSONArgs(item.Arguments.OfString)
+			if err != nil {
+				return nil, err
+			}
 			content.Parts = append(content.Parts, &genai.Part{
 				FunctionCall: &genai.FunctionCall{
 					ID:   item.CallID,
 					Name: item.Name,
-					Args: parseJSONArgs(item.Arguments.OfString),
+					Args: args,
 				},
 			})
 		}
@@ -735,6 +948,15 @@ func convertTools(genaiTools []*genai.Tool) ([]responses.ToolUnionParam, error) 
 	for _, genaiTool := range genaiTools {
 		if genaiTool == nil {
 			continue
+		}
+
+		// Tool facets other than function declarations (GoogleSearch,
+		// CodeExecution, ...) have no Responses API mapping; failing loud
+		// beats silently sending no tool at all.
+		rest := *genaiTool
+		rest.FunctionDeclarations = nil
+		if data, err := json.Marshal(rest); err == nil && string(data) != "{}" {
+			return nil, fmt.Errorf("unsupported tool fields for the Responses API: %s", data)
 		}
 
 		for _, funcDecl := range genaiTool.FunctionDeclarations {
@@ -767,8 +989,10 @@ func convertTools(genaiTools []*genai.Tool) ([]responses.ToolUnionParam, error) 
 
 // --- Helper functions ---
 
-// convertInlineDataToPart converts inline data to the appropriate Responses API content part.
-// Supports images (as data URI) and generic files (PDF, text, audio).
+// convertInlineDataToPart converts inline data to the appropriate Responses
+// API content part. Images become input_image data URIs and documents become
+// input_file data; audio is rejected because the API's file inputs do not
+// accept it.
 func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentUnionParam, error) {
 	if data == nil {
 		return nil, fmt.Errorf("inline data is nil")
@@ -788,26 +1012,91 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 			},
 		}, nil
 
-	case mediaType == "application/pdf" || strings.HasPrefix(mediaType, "text/") ||
-		strings.HasPrefix(mediaType, "audio/"):
+	case isDocumentMIMEType(mediaType):
 		return &responses.ResponseInputContentUnionParam{
 			OfInputFile: &responses.ResponseInputFileParam{
 				FileData: param.NewOpt(dataURI),
 			},
 		}, nil
 
+	case strings.HasPrefix(mediaType, "audio/"):
+		// The API's file inputs accept no audio and the SDK's input
+		// content union has no input_audio member, so audio is rejected
+		// instead of being sent as a file the server will refuse.
+		return nil, fmt.Errorf("audio input is not supported by the Responses API adapter: %s", mediaType)
+
 	default:
 		return nil, fmt.Errorf("unsupported inline data MIME type for Responses API: %s", mediaType)
 	}
 }
 
-// convertFileDataToPart maps a FileData part to an input_image content part;
-// the URI goes through verbatim, nothing is downloaded. Images only: file
-// inputs need uploaded bytes (InlineData). Plain http is allowed for
-// API-compatible gateways. Other schemes error instead of being silently
-// dropped; gs://, the scheme genai.FileData documents, gets its own message
-// pointing at InlineData. DisplayName is dropped: input_image has no field
-// for it.
+// isDocumentMIMEType reports whether a media type is in the Responses API's
+// documented file-input list: text/ wholesale, plus the documented
+// application/ and message/ types (documents, spreadsheets, presentations,
+// and code carriers).
+func isDocumentMIMEType(mediaType string) bool {
+	if strings.HasPrefix(mediaType, "text/") {
+		return true
+	}
+	switch mediaType {
+	case "application/pdf",
+		"message/rfc822",
+		// Spreadsheets.
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		"application/vnd.ms-excel",
+		"application/csv",
+		"application/x-iif",
+		"application/vnd.google-apps.spreadsheet",
+		// Rich documents.
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		"application/msword",
+		"application/rtf",
+		"application/vnd.oasis.opendocument.text",
+		"application/vnd.apple.pages",
+		"application/vnd.google-apps.document",
+		"application/vnd.apple.iwork",
+		// Presentations.
+		"application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		"application/vnd.ms-powerpoint",
+		"application/vnd.apple.keynote",
+		"application/vnd.google-apps.presentation",
+		// Code and structured text.
+		"application/javascript",
+		"application/typescript",
+		"application/json",
+		"application/json5",
+		"application/x-json5",
+		"application/x-ndjson",
+		"application/yaml",
+		"application/x-yaml",
+		"application/toml",
+		"application/graphql",
+		"application/x-graphql",
+		"application/x-protobuf",
+		"application/x-sql",
+		"application/x-scala",
+		"application/x-rust",
+		"application/x-php",
+		"application/x-httpd-php",
+		"application/x-httpd-php-source",
+		"application/x-powershell",
+		"application/x-bash",
+		"application/x-awk",
+		"application/x-terraform",
+		"application/x-patch",
+		"application/x-subrip":
+		return true
+	}
+	return false
+}
+
+// convertFileDataToPart maps a FileData part to a content part; the URI goes
+// through verbatim, nothing is downloaded. Images become input_image and
+// documents become input_file with file_url; audio has no URL transport in
+// the API. Plain http is allowed for API-compatible gateways. Other schemes
+// error instead of being silently dropped; gs://, the scheme genai.FileData
+// documents, gets its own message pointing at InlineData. DisplayName is
+// dropped: neither part has a field for it.
 func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputContentUnionParam, error) {
 	if data == nil {
 		return nil, fmt.Errorf("file data is nil")
@@ -820,14 +1109,25 @@ func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputConten
 	}
 
 	mediaType := normalizeMIMEType(data.MIMEType)
-	switch mediaType {
-	case "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp":
+	switch {
+	case mediaType == "image/jpeg" || mediaType == "image/jpg" || mediaType == "image/png" ||
+		mediaType == "image/gif" || mediaType == "image/webp":
 		return &responses.ResponseInputContentUnionParam{
 			OfInputImage: &responses.ResponseInputImageParam{
 				ImageURL: param.NewOpt(data.FileURI),
 				Detail:   responses.ResponseInputImageDetailAuto,
 			},
 		}, nil
+
+	case isDocumentMIMEType(mediaType):
+		return &responses.ResponseInputContentUnionParam{
+			OfInputFile: &responses.ResponseInputFileParam{
+				FileURL: param.NewOpt(data.FileURI),
+			},
+		}, nil
+
+	case strings.HasPrefix(mediaType, "audio/"):
+		return nil, fmt.Errorf("audio input is not supported by the Responses API adapter: %s", mediaType)
 
 	default:
 		return nil, fmt.Errorf("unsupported file data MIME type for Responses API: %s", mediaType)
@@ -893,6 +1193,8 @@ func convertStatus(status responses.ResponseStatus, details responses.ResponseIn
 // convertThinkingLevel maps genai thinking levels to Responses API reasoning effort.
 func convertThinkingLevel(level genai.ThinkingLevel) shared.ReasoningEffort {
 	switch level {
+	case genai.ThinkingLevelMinimal:
+		return shared.ReasoningEffortMinimal
 	case genai.ThinkingLevelLow:
 		return shared.ReasoningEffortLow
 	case genai.ThinkingLevelHigh:
@@ -1136,6 +1438,15 @@ func normalizeStrictSchema(schema map[string]any) {
 		}
 	}
 
+	// OpenAPI-style "nullable" is not a JSON Schema keyword and the strict
+	// validator rejects it; it converts faithfully to a null type union.
+	if v, ok := schema["nullable"]; ok {
+		if b, _ := v.(bool); b {
+			makeNullable(schema)
+		}
+		delete(schema, "nullable")
+	}
+
 	if !isObjectSchema(schema) {
 		return
 	}
@@ -1167,7 +1478,7 @@ func normalizeStrictSchema(schema map[string]any) {
 	schema["required"] = allKeys
 }
 
-// isObjectSchema returns true if the schema represents an object — either
+// isObjectSchema returns true if the schema represents an object, either
 // by explicit type or by having a "properties" field (common in dynamically
 // registered tools that omit "type").
 func isObjectSchema(schema map[string]any) bool {
@@ -1195,7 +1506,8 @@ func isObjectType(schema map[string]any) bool {
 }
 
 // makeNullable expands a property's type to ["<original>", "null"] so strict
-// mode accepts it as an optional (nullable) field.
+// mode accepts it as an optional (nullable) field. Properties without a
+// "type" key ($ref, typeless anyOf unions) get a null branch instead.
 // ensureTypeForLiteral fills in a missing "type" on schemas written as a
 // bare const or enum. The API rejects such nodes with "schema must have a
 // 'type' key", and the type of a literal follows from its value, so it is
@@ -1263,6 +1575,18 @@ func makeNullable(prop any) {
 			}
 		}
 		propMap["type"] = append(t, "null")
+	default:
+		// No "type" to extend: a typeless anyOf union (oneOf is already
+		// renamed by this point) gets a null branch, keeping the property
+		// optional instead of silently becoming required.
+		if branches, ok := propMap["anyOf"].([]any); ok {
+			for _, b := range branches {
+				if bm, ok := b.(map[string]any); ok && bm["type"] == "null" {
+					return
+				}
+			}
+			propMap["anyOf"] = append(branches, map[string]any{"type": "null"})
+		}
 	}
 }
 
@@ -1396,14 +1720,16 @@ func joinTexts(texts []string) string {
 	return strings.Join(texts, "\n")
 }
 
-// parseJSONArgs parses a JSON string into a map. Returns empty map on error.
-func parseJSONArgs(argsJSON string) map[string]any {
+// parseJSONArgs parses a function-call arguments string into a map. Malformed
+// JSON is an error, not an empty map: a tool with side effects must not run
+// with silently emptied arguments.
+func parseJSONArgs(argsJSON string) (map[string]any, error) {
 	if argsJSON == "" {
-		return make(map[string]any)
+		return make(map[string]any), nil
 	}
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return make(map[string]any)
+		return nil, fmt.Errorf("malformed function call arguments %q: %w", argsJSON, err)
 	}
-	return args
+	return args, nil
 }

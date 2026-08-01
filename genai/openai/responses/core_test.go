@@ -13,6 +13,7 @@ package responses
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -447,5 +448,66 @@ func TestLowercaseTypes(t *testing.T) {
 				t.Errorf("after lowercaseTypes:\n got = %#v\nwant = %#v", c.in, c.want)
 			}
 		})
+	}
+}
+
+// Optional properties written as a typeless anyOf union must gain a null
+// branch when strict mode moves them into required; without it a previously
+// optional parameter silently becomes mandatory. A union that already has a
+// null branch stays unchanged.
+func TestNormalizeStrictSchema_OptionalAnyOfGetsNullBranch(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"target": map[string]any{"anyOf": []any{
+				map[string]any{"type": "string"},
+				map[string]any{"type": "integer"},
+			}},
+		},
+	}
+
+	normalizeStrictSchema(schema)
+	normalizeStrictSchema(schema) // idempotent: a second pass adds nothing
+
+	target := schema["properties"].(map[string]any)["target"].(map[string]any)
+	branches, _ := target["anyOf"].([]any)
+	if len(branches) != 3 {
+		t.Fatalf("anyOf branches = %d, want 3 (original two plus null)", len(branches))
+	}
+	last, _ := branches[2].(map[string]any)
+	if last["type"] != "null" {
+		t.Errorf("last branch = %+v, want {type: null}", last)
+	}
+}
+
+// OpenAPI-style "nullable" is not a JSON Schema keyword and the strict
+// validator rejects it, so it must convert to a null type union (true) or
+// simply disappear (false).
+func TestNormalizeStrictSchema_NullableConvertsToNullUnion(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"note": map[string]any{"type": "string", "nullable": true},
+			"tag":  map[string]any{"type": "string", "nullable": false},
+		},
+		"required": []any{"note", "tag"},
+	}
+
+	normalizeStrictSchema(schema)
+
+	props := schema["properties"].(map[string]any)
+	note := props["note"].(map[string]any)
+	if _, ok := note["nullable"]; ok {
+		t.Errorf("nullable key survived normalization: %+v", note)
+	}
+	if got, want := fmt.Sprintf("%v", note["type"]), "[string null]"; got != want {
+		t.Errorf("note type = %v, want %v", note["type"], want)
+	}
+	tag := props["tag"].(map[string]any)
+	if _, ok := tag["nullable"]; ok {
+		t.Errorf("nullable key survived normalization: %+v", tag)
+	}
+	if tag["type"] != "string" {
+		t.Errorf("tag type = %v, want string (nullable false adds nothing)", tag["type"])
 	}
 }
