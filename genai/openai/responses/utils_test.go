@@ -68,6 +68,7 @@ func TestConvertThinkingLevel(t *testing.T) {
 		level genai.ThinkingLevel
 		want  shared.ReasoningEffort
 	}{
+		{genai.ThinkingLevelMinimal, shared.ReasoningEffortMinimal},
 		{genai.ThinkingLevelLow, shared.ReasoningEffortLow},
 		{genai.ThinkingLevelHigh, shared.ReasoningEffortHigh},
 		{genai.ThinkingLevel(""), shared.ReasoningEffortMedium},

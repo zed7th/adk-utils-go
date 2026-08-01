@@ -54,11 +54,13 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"mime"
 	"net/http"
 	"os"
 	"sort"
 	"strings"
 
+	"github.com/achetronic/adk-utils-go/genai/common"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
@@ -86,6 +88,7 @@ type Model struct {
 
 // HTTPOptions holds optional HTTP-level configuration for the OpenAI client.
 type HTTPOptions struct {
+	Client  *http.Client
 	Headers http.Header
 }
 
@@ -110,6 +113,9 @@ func New(cfg Config) *Model {
 	}
 	if cfg.BaseURL != "" {
 		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
+	}
+	if cfg.HTTPOptions.Client != nil {
+		opts = append(opts, option.WithHTTPClient(cfg.HTTPOptions.Client))
 	}
 	for k, vals := range cfg.HTTPOptions.Headers {
 		for _, v := range vals {
@@ -407,8 +413,12 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 	// Reasoning (native support via Responses API)
 	if cfg.ThinkingConfig != nil {
 		params.Reasoning = shared.ReasoningParam{
-			Effort:  convertThinkingLevel(cfg.ThinkingConfig.ThinkingLevel),
-			Summary: shared.ReasoningSummaryAuto,
+			Effort: convertThinkingLevel(cfg.ThinkingConfig.ThinkingLevel),
+		}
+		// Summaries are requested only when the caller wants thoughts
+		// surfaced; encrypted reasoning replay works without them.
+		if cfg.ThinkingConfig.IncludeThoughts {
+			params.Reasoning.Summary = shared.ReasoningSummaryAuto
 		}
 	}
 
@@ -492,6 +502,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 	var textParts []string
 	var mediaParts []responses.ResponseInputContentUnionParam
 	var phase string
+	var messageID string
 	role := convertRole(content.Role)
 
 	// A replayed reasoning item must be followed by another item from the
@@ -524,6 +535,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 				})
 			}
 			msg := responses.ResponseOutputMessageParam{
+				ID:      messageID,
 				Content: contentParts,
 				Status:  responses.ResponseOutputMessageStatusCompleted,
 				Phase:   responses.ResponseOutputMessagePhase(phase),
@@ -549,13 +561,14 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 		textParts = nil
 		mediaParts = nil
 		phase = ""
+		messageID = ""
 	}
 
 	for i, part := range content.Parts {
 		switch {
 		case part.FunctionResponse != nil:
 			flushMessage()
-			responseJSON, err := json.Marshal(part.FunctionResponse.Response)
+			responseJSON, err := common.MarshalToolPayload(part.FunctionResponse.Response)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal function response: %w", err)
 			}
@@ -565,7 +578,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 
 		case part.FunctionCall != nil:
 			flushMessage()
-			argsJSON, err := json.Marshal(part.FunctionCall.Args)
+			argsJSON, err := common.MarshalToolPayload(part.FunctionCall.Args)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal function args: %w", err)
 			}
@@ -620,11 +633,18 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 			})
 
 		case part.Text != "":
-			if part.PartMetadata != nil {
-				if p, ok := part.PartMetadata["phase"].(string); ok && p != "" {
-					phase = p
-				}
+			// Parts from different output messages must not coalesce:
+			// flushing on a message_id or phase change keeps each replayed
+			// message's identity and phase intact (models like
+			// gpt-5.3-codex expect commentary and final answer separate).
+			partID, _ := part.PartMetadata["message_id"].(string)
+			partPhase, _ := part.PartMetadata["phase"].(string)
+			if (len(textParts) > 0 || len(mediaParts) > 0) &&
+				(partID != messageID || partPhase != phase) {
+				flushMessage()
 			}
+			messageID = partID
+			phase = partPhase
 			textParts = append(textParts, part.Text)
 
 		case part.InlineData != nil:
@@ -773,7 +793,7 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 		return nil, fmt.Errorf("inline data is nil")
 	}
 
-	mediaType := data.MIMEType
+	mediaType := normalizeMIMEType(data.MIMEType)
 	base64Data := base64.StdEncoding.EncodeToString(data.Data)
 	dataURI := fmt.Sprintf("data:%s;base64,%s", mediaType, base64Data)
 
@@ -800,16 +820,26 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 	}
 }
 
-// convertFileDataToPart converts URL-referenced file data to a Responses API content part.
-// Only images are supported: the Responses API accepts a remote URL for input_image,
-// whereas file inputs require the bytes to be uploaded first.
-// Returns an error for unsupported MIME types, mirroring convertInlineDataToPart.
+// convertFileDataToPart maps a FileData part to an input_image content part;
+// the URI goes through verbatim, nothing is downloaded. Images only: file
+// inputs need uploaded bytes (InlineData). Plain http is allowed for
+// API-compatible gateways. Other schemes error instead of being silently
+// dropped; gs://, the scheme genai.FileData documents, gets its own message
+// pointing at InlineData. DisplayName is dropped: input_image has no field
+// for it.
 func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputContentUnionParam, error) {
 	if data == nil {
 		return nil, fmt.Errorf("file data is nil")
 	}
+	if strings.HasPrefix(data.FileURI, "gs://") {
+		return nil, fmt.Errorf("file data URI %q is a Google Cloud Storage URI, which the Responses API cannot fetch: download the bytes and use InlineData instead", data.FileURI)
+	}
+	if !strings.HasPrefix(data.FileURI, "https://") && !strings.HasPrefix(data.FileURI, "http://") {
+		return nil, fmt.Errorf("file data URI must be an http(s) URL for the Responses API, got %q", data.FileURI)
+	}
 
-	switch data.MIMEType {
+	mediaType := normalizeMIMEType(data.MIMEType)
+	switch mediaType {
 	case "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp":
 		return &responses.ResponseInputContentUnionParam{
 			OfInputImage: &responses.ResponseInputImageParam{
@@ -819,8 +849,20 @@ func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputConten
 		}, nil
 
 	default:
-		return nil, fmt.Errorf("unsupported file data MIME type for Responses API: %s", data.MIMEType)
+		return nil, fmt.Errorf("unsupported file data MIME type for Responses API: %s", mediaType)
 	}
+}
+
+// normalizeMIMEType strips parameters from a MIME string ("image/png;
+// charset=utf-8" becomes "image/png") so the converters match on the media
+// type alone. Malformed strings come back unchanged and fail the match with
+// the caller's input in the error.
+func normalizeMIMEType(mimeType string) string {
+	mediaType, _, err := mime.ParseMediaType(mimeType)
+	if err != nil {
+		return mimeType
+	}
+	return mediaType
 }
 
 // convertUsageMetadata converts Responses API usage stats to genai format.
@@ -870,6 +912,8 @@ func convertStatus(status responses.ResponseStatus, details responses.ResponseIn
 // convertThinkingLevel maps genai thinking levels to Responses API reasoning effort.
 func convertThinkingLevel(level genai.ThinkingLevel) shared.ReasoningEffort {
 	switch level {
+	case genai.ThinkingLevelMinimal:
+		return shared.ReasoningEffortMinimal
 	case genai.ThinkingLevelLow:
 		return shared.ReasoningEffortLow
 	case genai.ThinkingLevelHigh:
@@ -1172,7 +1216,8 @@ func isObjectType(schema map[string]any) bool {
 }
 
 // makeNullable expands a property's type to ["<original>", "null"] so strict
-// mode accepts it as an optional (nullable) field.
+// mode accepts it as an optional (nullable) field. Properties without a
+// "type" key ($ref, typeless anyOf unions) get a null branch instead.
 // ensureTypeForLiteral fills in a missing "type" on schemas written as a
 // bare const or enum. The API rejects such nodes with "schema must have a
 // 'type' key", and the type of a literal follows from its value, so it is
@@ -1240,6 +1285,18 @@ func makeNullable(prop any) {
 			}
 		}
 		propMap["type"] = append(t, "null")
+	default:
+		// No "type" to extend: a typeless anyOf union (oneOf is already
+		// renamed by this point) gets a null branch, keeping the property
+		// optional instead of silently becoming required.
+		if branches, ok := propMap["anyOf"].([]any); ok {
+			for _, b := range branches {
+				if bm, ok := b.(map[string]any); ok && bm["type"] == "null" {
+					return
+				}
+			}
+			propMap["anyOf"] = append(branches, map[string]any{"type": "null"})
+		}
 	}
 }
 

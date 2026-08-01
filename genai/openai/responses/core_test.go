@@ -449,3 +449,32 @@ func TestLowercaseTypes(t *testing.T) {
 		})
 	}
 }
+
+// Optional properties written as a typeless anyOf union must gain a null
+// branch when strict mode moves them into required; without it a previously
+// optional parameter silently becomes mandatory. A union that already has a
+// null branch stays unchanged.
+func TestNormalizeStrictSchema_OptionalAnyOfGetsNullBranch(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"target": map[string]any{"anyOf": []any{
+				map[string]any{"type": "string"},
+				map[string]any{"type": "integer"},
+			}},
+		},
+	}
+
+	normalizeStrictSchema(schema)
+	normalizeStrictSchema(schema) // idempotent: a second pass adds nothing
+
+	target := schema["properties"].(map[string]any)["target"].(map[string]any)
+	branches, _ := target["anyOf"].([]any)
+	if len(branches) != 3 {
+		t.Fatalf("anyOf branches = %d, want 3 (original two plus null)", len(branches))
+	}
+	last, _ := branches[2].(map[string]any)
+	if last["type"] != "null" {
+		t.Errorf("last branch = %+v, want {type: null}", last)
+	}
+}

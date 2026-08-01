@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )
@@ -451,5 +452,40 @@ func TestBuildResponseParams_InvalidToolPropagates(t *testing.T) {
 
 	if _, err := m.buildResponseParams(req); err == nil {
 		t.Fatalf("buildResponseParams() error = nil, want tool conversion error")
+	}
+}
+
+// Reasoning summaries are only requested when the caller asks for thoughts;
+// the effort level maps regardless.
+func TestBuildResponseParams_ReasoningSummaryFollowsIncludeThoughts(t *testing.T) {
+	m := New(Config{APIKey: "test", ModelName: "gpt-5.5"})
+
+	req := &model.LLMRequest{Config: &genai.GenerateContentConfig{
+		ThinkingConfig: &genai.ThinkingConfig{
+			IncludeThoughts: true,
+			ThinkingLevel:   genai.ThinkingLevelLow,
+		},
+	}}
+	params, err := m.buildResponseParams(req)
+	if err != nil {
+		t.Fatalf("buildResponseParams: %v", err)
+	}
+	if params.Reasoning.Summary != shared.ReasoningSummaryAuto {
+		t.Errorf("Summary = %q, want auto", params.Reasoning.Summary)
+	}
+	if params.Reasoning.Effort != shared.ReasoningEffortLow {
+		t.Errorf("Effort = %q, want low", params.Reasoning.Effort)
+	}
+
+	req.Config.ThinkingConfig.IncludeThoughts = false
+	params, err = m.buildResponseParams(req)
+	if err != nil {
+		t.Fatalf("buildResponseParams: %v", err)
+	}
+	if params.Reasoning.Summary != "" {
+		t.Errorf("Summary = %q, want unset when thoughts are not requested", params.Reasoning.Summary)
+	}
+	if params.Reasoning.Effort != shared.ReasoningEffortLow {
+		t.Errorf("Effort = %q, want low", params.Reasoning.Effort)
 	}
 }
