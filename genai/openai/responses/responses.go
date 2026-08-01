@@ -255,10 +255,15 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 				// final event includes them: losing a tool call would
 				// silently break the agent loop.
 				if event.Item.Type == "function_call" {
+					args, err := parseJSONArgs(event.Item.Arguments.OfString)
+					if err != nil {
+						yield(nil, err)
+						return
+					}
 					acc.functionCalls = append(acc.functionCalls, &genai.FunctionCall{
 						ID:   event.Item.CallID,
 						Name: event.Item.Name,
-						Args: parseJSONArgs(event.Item.Arguments.OfString),
+						Args: args,
 					})
 				}
 
@@ -453,6 +458,30 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 		}
 	}
 
+	// A raw JSON schema (ResponseJsonSchema) goes through the same pipeline
+	// as tool parameters: strict when it fits the subset, non-strict
+	// otherwise, never silently ignored. The typed ResponseSchema wins when
+	// both are set.
+	if cfg.ResponseSchema == nil && cfg.ResponseJsonSchema != nil {
+		schemaMap, strict := convertFunctionParams(cfg.ResponseJsonSchema)
+		if schemaMap == nil {
+			return fmt.Errorf("response json schema cannot be converted to a JSON schema object")
+		}
+		// Strict response formats additionally require an object root.
+		if !isObjectSchema(schemaMap) {
+			strict = false
+		}
+		params.Text = responses.ResponseTextConfigParam{
+			Format: responses.ResponseFormatTextConfigUnionParam{
+				OfJSONSchema: &responses.ResponseFormatTextJSONSchemaConfigParam{
+					Name:   "response",
+					Schema: schemaMap,
+					Strict: param.NewOpt(strict),
+				},
+			},
+		}
+	}
+
 	// Tools
 	if len(cfg.Tools) > 0 {
 		tools, err := convertTools(cfg.Tools)
@@ -525,9 +554,11 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 			return
 		}
 
-		// Model output with phase metadata builds an OutputMessage manually to
-		// preserve the phase field for GPT-5.3-Codex+ round-tripping.
-		if role == responses.EasyInputMessageRoleAssistant && phase != "" {
+		// Model output with a message ID or phase builds an OutputMessage
+		// manually, so the item identity survives the stateless round trip
+		// (models like gpt-5.3-codex expect phase back on every assistant
+		// message, and the API asks for output items to be replayed as-is).
+		if role == responses.EasyInputMessageRoleAssistant && (messageID != "" || phase != "") {
 			var contentParts []responses.ResponseOutputMessageContentUnionParam
 			for _, t := range textParts {
 				contentParts = append(contentParts, responses.ResponseOutputMessageContentUnionParam{
@@ -544,18 +575,33 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 				OfOutputMessage: &msg,
 			})
 		} else if len(mediaParts) == 0 {
-			items = append(items, responses.ResponseInputItemParamOfMessage(
-				joinTexts(textParts), role,
-			))
+			// Type is set explicitly: the OpenAPI spec discriminates input
+			// union items on it, even though the endpoint tolerates its
+			// absence.
+			items = append(items, responses.ResponseInputItemUnionParam{
+				OfMessage: &responses.EasyInputMessageParam{
+					Content: responses.EasyInputMessageContentUnionParam{
+						OfString: param.NewOpt(joinTexts(textParts)),
+					},
+					Role: role,
+					Type: responses.EasyInputMessageTypeMessage,
+				},
+			})
 		} else {
 			var contentList responses.ResponseInputMessageContentListParam
 			for _, t := range textParts {
 				contentList = append(contentList, responses.ResponseInputContentParamOfInputText(t))
 			}
 			contentList = append(contentList, mediaParts...)
-			items = append(items, responses.ResponseInputItemParamOfMessage(
-				contentList, role,
-			))
+			items = append(items, responses.ResponseInputItemUnionParam{
+				OfMessage: &responses.EasyInputMessageParam{
+					Content: responses.EasyInputMessageContentUnionParam{
+						OfInputItemContentList: contentList,
+					},
+					Role: role,
+					Type: responses.EasyInputMessageTypeMessage,
+				},
+			})
 		}
 
 		textParts = nil
@@ -729,11 +775,15 @@ func convertResponse(resp *responses.Response, origin string) (*model.LLMRespons
 			}
 
 		case "function_call":
+			args, err := parseJSONArgs(item.Arguments.OfString)
+			if err != nil {
+				return nil, err
+			}
 			content.Parts = append(content.Parts, &genai.Part{
 				FunctionCall: &genai.FunctionCall{
 					ID:   item.CallID,
 					Name: item.Name,
-					Args: parseJSONArgs(item.Arguments.OfString),
+					Args: args,
 				},
 			})
 		}
@@ -754,6 +804,15 @@ func convertTools(genaiTools []*genai.Tool) ([]responses.ToolUnionParam, error) 
 	for _, genaiTool := range genaiTools {
 		if genaiTool == nil {
 			continue
+		}
+
+		// Tool facets other than function declarations (GoogleSearch,
+		// CodeExecution, ...) have no Responses API mapping; failing loud
+		// beats silently sending no tool at all.
+		rest := *genaiTool
+		rest.FunctionDeclarations = nil
+		if data, err := json.Marshal(rest); err == nil && string(data) != "{}" {
+			return nil, fmt.Errorf("unsupported tool fields for the Responses API: %s", data)
 		}
 
 		for _, funcDecl := range genaiTool.FunctionDeclarations {
@@ -820,13 +879,13 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 	}
 }
 
-// convertFileDataToPart maps a FileData part to an input_image content part;
-// the URI goes through verbatim, nothing is downloaded. Images only: file
-// inputs need uploaded bytes (InlineData). Plain http is allowed for
-// API-compatible gateways. Other schemes error instead of being silently
-// dropped; gs://, the scheme genai.FileData documents, gets its own message
-// pointing at InlineData. DisplayName is dropped: input_image has no field
-// for it.
+// convertFileDataToPart maps a FileData part to a content part; the URI goes
+// through verbatim, nothing is downloaded. Images become input_image, PDFs
+// become input_file with file_url; other media types need uploaded bytes
+// (InlineData). Plain http is allowed for API-compatible gateways. Other
+// schemes error instead of being silently dropped; gs://, the scheme
+// genai.FileData documents, gets its own message pointing at InlineData.
+// DisplayName is dropped: neither part has a field for it.
 func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputContentUnionParam, error) {
 	if data == nil {
 		return nil, fmt.Errorf("file data is nil")
@@ -845,6 +904,13 @@ func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputConten
 			OfInputImage: &responses.ResponseInputImageParam{
 				ImageURL: param.NewOpt(data.FileURI),
 				Detail:   responses.ResponseInputImageDetailAuto,
+			},
+		}, nil
+
+	case "application/pdf":
+		return &responses.ResponseInputContentUnionParam{
+			OfInputFile: &responses.ResponseInputFileParam{
+				FileURL: param.NewOpt(data.FileURI),
 			},
 		}, nil
 
@@ -1157,6 +1223,15 @@ func normalizeStrictSchema(schema map[string]any) {
 		}
 	}
 
+	// OpenAPI-style "nullable" is not a JSON Schema keyword and the strict
+	// validator rejects it; it converts faithfully to a null type union.
+	if v, ok := schema["nullable"]; ok {
+		if b, _ := v.(bool); b {
+			makeNullable(schema)
+		}
+		delete(schema, "nullable")
+	}
+
 	if !isObjectSchema(schema) {
 		return
 	}
@@ -1430,14 +1505,16 @@ func joinTexts(texts []string) string {
 	return strings.Join(texts, "\n")
 }
 
-// parseJSONArgs parses a JSON string into a map. Returns empty map on error.
-func parseJSONArgs(argsJSON string) map[string]any {
+// parseJSONArgs parses a function-call arguments string into a map. Malformed
+// JSON is an error, not an empty map: a tool with side effects must not run
+// with silently emptied arguments.
+func parseJSONArgs(argsJSON string) (map[string]any, error) {
 	if argsJSON == "" {
-		return make(map[string]any)
+		return make(map[string]any), nil
 	}
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return make(map[string]any)
+		return nil, fmt.Errorf("malformed function call arguments %q: %w", argsJSON, err)
 	}
-	return args
+	return args, nil
 }

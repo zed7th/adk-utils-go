@@ -13,6 +13,7 @@ package responses
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -476,5 +477,37 @@ func TestNormalizeStrictSchema_OptionalAnyOfGetsNullBranch(t *testing.T) {
 	last, _ := branches[2].(map[string]any)
 	if last["type"] != "null" {
 		t.Errorf("last branch = %+v, want {type: null}", last)
+	}
+}
+
+// OpenAPI-style "nullable" is not a JSON Schema keyword and the strict
+// validator rejects it, so it must convert to a null type union (true) or
+// simply disappear (false).
+func TestNormalizeStrictSchema_NullableConvertsToNullUnion(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"note": map[string]any{"type": "string", "nullable": true},
+			"tag":  map[string]any{"type": "string", "nullable": false},
+		},
+		"required": []any{"note", "tag"},
+	}
+
+	normalizeStrictSchema(schema)
+
+	props := schema["properties"].(map[string]any)
+	note := props["note"].(map[string]any)
+	if _, ok := note["nullable"]; ok {
+		t.Errorf("nullable key survived normalization: %+v", note)
+	}
+	if got, want := fmt.Sprintf("%v", note["type"]), "[string null]"; got != want {
+		t.Errorf("note type = %v, want %v", note["type"], want)
+	}
+	tag := props["tag"].(map[string]any)
+	if _, ok := tag["nullable"]; ok {
+		t.Errorf("nullable key survived normalization: %+v", tag)
+	}
+	if tag["type"] != "string" {
+		t.Errorf("tag type = %v, want string (nullable false adds nothing)", tag["type"])
 	}
 }

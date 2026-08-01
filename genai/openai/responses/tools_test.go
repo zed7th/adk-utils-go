@@ -136,25 +136,24 @@ func TestConvertInlineDataToPart(t *testing.T) {
 }
 
 // convertFileDataToPart passes a remote image URL straight through to
-// ResponseInputImageParam. Only image MIME types are supported and the URI
-// must be http(s); plain http is allowed for API-compatible gateways.
-// Everything else (and a nil input) must return an error, because the
-// Responses API only accepts a URL for images while files require uploaded
-// bytes.
+// ResponseInputImageParam and a remote PDF to ResponseInputFileParam's
+// file_url. The URI must be http(s); plain http is allowed for
+// API-compatible gateways. Everything else (and a nil input) must return an
+// error instead of being silently dropped.
 func TestConvertFileDataToPart(t *testing.T) {
 	const fileURI = "https://cdn.example.com/cat.png"
 
 	cases := []struct {
 		name     string
 		data     *genai.FileData
-		wantType string // "image", "error"
+		wantType string // "image", "file", "error"
 	}{
 		{"png image", &genai.FileData{MIMEType: "image/png", FileURI: fileURI}, "image"},
 		{"jpeg image", &genai.FileData{MIMEType: "image/jpeg", FileURI: fileURI}, "image"},
 		{"webp image", &genai.FileData{MIMEType: "image/webp", FileURI: fileURI}, "image"},
 		{"plain http allowed for gateways", &genai.FileData{MIMEType: "image/png", FileURI: "http://localhost:8080/cat.png"}, "image"},
 		{"MIME parameters stripped", &genai.FileData{MIMEType: "image/png; charset=utf-8", FileURI: fileURI}, "image"},
-		{"pdf unsupported", &genai.FileData{MIMEType: "application/pdf", FileURI: fileURI}, "error"},
+		{"pdf becomes input_file", &genai.FileData{MIMEType: "application/pdf", FileURI: "https://cdn.example.com/report.pdf"}, "file"},
 		{"unsupported", &genai.FileData{MIMEType: "video/mp4", FileURI: fileURI}, "error"},
 		{"empty MIME type rejected", &genai.FileData{MIMEType: "", FileURI: fileURI}, "error"},
 		{"gs scheme rejected", &genai.FileData{MIMEType: "image/png", FileURI: "gs://bucket/cat.png"}, "error"},
@@ -175,6 +174,15 @@ func TestConvertFileDataToPart(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
+			}
+			if c.wantType == "file" {
+				if got.OfInputFile == nil {
+					t.Fatalf("expected OfInputFile, got %+v", got)
+				}
+				if url := got.OfInputFile.FileURL.Value; url != c.data.FileURI {
+					t.Errorf("FileURL = %q, want the raw file URI %q", url, c.data.FileURI)
+				}
+				return
 			}
 			if got.OfInputImage == nil {
 				t.Fatalf("expected OfInputImage, got %+v", got)
@@ -199,5 +207,14 @@ func TestConvertTools_UnserializableParams(t *testing.T) {
 
 	if _, err := convertTools(tools); err == nil {
 		t.Fatalf("convertTools() error = nil, want serialization error")
+	}
+}
+
+// Tool facets without a Responses API mapping must error instead of
+// silently producing an empty tool list.
+func TestConvertTools_UnsupportedFacetsError(t *testing.T) {
+	_, err := convertTools([]*genai.Tool{{GoogleSearch: &genai.GoogleSearch{}}})
+	if err == nil {
+		t.Fatalf("expected an error for a GoogleSearch tool, got none")
 	}
 }

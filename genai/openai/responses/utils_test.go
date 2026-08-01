@@ -147,19 +147,32 @@ func TestJoinTexts(t *testing.T) {
 	}
 }
 
+// Malformed arguments must error instead of degrading to an empty map: a
+// tool with side effects must not run with silently emptied arguments.
 func TestParseJSONArgs(t *testing.T) {
 	cases := []struct {
-		name string
-		in   string
-		want int // expected number of keys
+		name    string
+		in      string
+		want    int // expected number of keys
+		wantErr bool
 	}{
-		{"empty string", "", 0},
-		{"valid object", `{"a":1,"b":2}`, 2},
-		{"malformed JSON", `{broken`, 0},
+		{"empty string", "", 0, false},
+		{"valid object", `{"a":1,"b":2}`, 2, false},
+		{"malformed JSON", `{broken`, 0, true},
+		{"truncated JSON", `{`, 0, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := parseJSONArgs(c.in)
+			got, err := parseJSONArgs(c.in)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("parseJSONArgs(%q) = %v, want error", c.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseJSONArgs(%q): %v", c.in, err)
+			}
 			if len(got) != c.want {
 				t.Errorf("parseJSONArgs(%q) has %d keys, want %d", c.in, len(got), c.want)
 			}

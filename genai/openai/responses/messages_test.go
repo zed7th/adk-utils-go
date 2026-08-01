@@ -537,3 +537,35 @@ func TestConvertContentToInputItems_SameMessagePartsCoalesce(t *testing.T) {
 		t.Errorf("content parts = %d, want 2", len(msg.Content))
 	}
 }
+
+// A message ID without phase must still replay as an OutputMessage so the
+// item identity survives the stateless round trip.
+func TestConvertContentToInputItems_MessageIDWithoutPhase(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text:         "plain but identified",
+				PartMetadata: map[string]any{"message_id": "msg_9"},
+			},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	msg := items[0].OfOutputMessage
+	if msg == nil {
+		t.Fatalf("expected an OutputMessage, got %+v", items[0])
+	}
+	if msg.ID != "msg_9" {
+		t.Errorf("ID = %q, want msg_9", msg.ID)
+	}
+	if msg.Phase != "" {
+		t.Errorf("Phase = %q, want empty", msg.Phase)
+	}
+}

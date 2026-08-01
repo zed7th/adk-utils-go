@@ -489,3 +489,81 @@ func TestBuildResponseParams_ReasoningSummaryFollowsIncludeThoughts(t *testing.T
 		t.Errorf("Effort = %q, want low", params.Reasoning.Effort)
 	}
 }
+
+// Malformed function-call arguments must fail the conversion: a tool with
+// side effects must not run with silently emptied arguments.
+func TestConvertResponse_MalformedArgumentsError(t *testing.T) {
+	raw := []byte(`{
+		"id": "resp-7",
+		"status": "completed",
+		"output": [{
+			"type": "function_call",
+			"id": "fc-1",
+			"call_id": "call_1",
+			"name": "delete_things",
+			"arguments": "{"
+		}],
+		"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+			"input_tokens_details": {"cached_tokens": 0},
+			"output_tokens_details": {"reasoning_tokens": 0}}
+	}`)
+
+	var resp responses.Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if _, err := convertResponse(&resp, "test-origin"); err == nil {
+		t.Fatalf("expected an error for malformed arguments, got none")
+	}
+}
+
+// A raw JSON schema set via ResponseJsonSchema must reach the request as a
+// json_schema response format: strict when it fits the subset, non-strict
+// with the schema intact otherwise. Ignoring it silently would let the model
+// answer unconstrained while the caller believes a schema is enforced.
+func TestBuildResponseParams_ResponseJsonSchema(t *testing.T) {
+	m := New(Config{APIKey: "test", ModelName: "gpt-5.5"})
+
+	strictSchema := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"score": map[string]any{"type": "number"}},
+	}
+	params, err := m.buildResponseParams(&model.LLMRequest{Config: &genai.GenerateContentConfig{
+		ResponseJsonSchema: strictSchema,
+	}})
+	if err != nil {
+		t.Fatalf("buildResponseParams: %v", err)
+	}
+	format := params.Text.Format.OfJSONSchema
+	if format == nil {
+		t.Fatalf("expected a json_schema response format, got %+v", params.Text.Format)
+	}
+	if !format.Strict.Valid() || !format.Strict.Value {
+		t.Errorf("Strict = %+v, want true for a subset-compatible schema", format.Strict)
+	}
+
+	lossySchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"code": map[string]any{"type": "string", "minLength": 2},
+		},
+	}
+	params, err = m.buildResponseParams(&model.LLMRequest{Config: &genai.GenerateContentConfig{
+		ResponseJsonSchema: lossySchema,
+	}})
+	if err != nil {
+		t.Fatalf("buildResponseParams: %v", err)
+	}
+	format = params.Text.Format.OfJSONSchema
+	if format == nil {
+		t.Fatalf("expected a json_schema response format, got %+v", params.Text.Format)
+	}
+	if !format.Strict.Valid() || format.Strict.Value {
+		t.Errorf("Strict = %+v, want false when the subset cannot express the schema", format.Strict)
+	}
+	code := format.Schema["properties"].(map[string]any)["code"].(map[string]any)
+	if code["minLength"] != float64(2) && code["minLength"] != 2 {
+		t.Errorf("minLength = %v, want preserved verbatim", code["minLength"])
+	}
+}
