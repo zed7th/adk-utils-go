@@ -88,8 +88,9 @@ func TestConvertTools(t *testing.T) {
 }
 
 // convertInlineDataToPart routes different MIME types to the correct
-// Responses API content part. Images use ResponseInputImageParam;
-// PDFs, text, and audio use ResponseInputFileParam.
+// Responses API content part. Images use ResponseInputImageParam; documents
+// use ResponseInputFileParam. Audio must error: the API's file inputs do not
+// accept it.
 func TestConvertInlineDataToPart(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -102,7 +103,8 @@ func TestConvertInlineDataToPart(t *testing.T) {
 		{"gif image", &genai.Blob{MIMEType: "image/gif", Data: []byte("x")}, "image"},
 		{"pdf file", &genai.Blob{MIMEType: "application/pdf", Data: []byte("x")}, "file"},
 		{"text file", &genai.Blob{MIMEType: "text/plain", Data: []byte("x")}, "file"},
-		{"audio file", &genai.Blob{MIMEType: "audio/wav", Data: []byte("x")}, "file"},
+		{"json file", &genai.Blob{MIMEType: "application/json", Data: []byte("x")}, "file"},
+		{"audio rejected", &genai.Blob{MIMEType: "audio/wav", Data: []byte("x")}, "error"},
 		{"unsupported", &genai.Blob{MIMEType: "video/mp4", Data: []byte("x")}, "error"},
 		{"nil blob", nil, "error"},
 	}
@@ -154,6 +156,9 @@ func TestConvertFileDataToPart(t *testing.T) {
 		{"plain http allowed for gateways", &genai.FileData{MIMEType: "image/png", FileURI: "http://localhost:8080/cat.png"}, "image"},
 		{"MIME parameters stripped", &genai.FileData{MIMEType: "image/png; charset=utf-8", FileURI: fileURI}, "image"},
 		{"pdf becomes input_file", &genai.FileData{MIMEType: "application/pdf", FileURI: "https://cdn.example.com/report.pdf"}, "file"},
+		{"docx becomes input_file", &genai.FileData{MIMEType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", FileURI: "https://cdn.example.com/spec.docx"}, "file"},
+		{"csv becomes input_file", &genai.FileData{MIMEType: "text/csv", FileURI: "https://cdn.example.com/data.csv"}, "file"},
+		{"audio URL rejected", &genai.FileData{MIMEType: "audio/mpeg", FileURI: "https://cdn.example.com/talk.mp3"}, "error"},
 		{"unsupported", &genai.FileData{MIMEType: "video/mp4", FileURI: fileURI}, "error"},
 		{"empty MIME type rejected", &genai.FileData{MIMEType: "", FileURI: fileURI}, "error"},
 		{"gs scheme rejected", &genai.FileData{MIMEType: "image/png", FileURI: "gs://bucket/cat.png"}, "error"},

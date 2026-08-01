@@ -46,6 +46,13 @@ const minimalResponseJSON = `{
 // put on the wire. Asserting on this (not on the pre-SDK params) is what
 // proves the bytes a real Responses API server receives are correct.
 func captureBody(t *testing.T, req *model.LLMRequest) map[string]any {
+	return captureBodyFor(t, Config{}, req)
+}
+
+// captureBodyFor mirrors captureBody but lets the test override Config
+// fields (the integration tier needs a real model name for its paid step);
+// BaseURL always points at the local fake server.
+func captureBodyFor(t *testing.T, cfg Config, req *model.LLMRequest) map[string]any {
 	t.Helper()
 
 	var captured []byte
@@ -56,7 +63,14 @@ func captureBody(t *testing.T, req *model.LLMRequest) map[string]any {
 	}))
 	defer srv.Close()
 
-	m := New(Config{BaseURL: srv.URL, APIKey: "test-key", ModelName: "gpt-test"})
+	cfg.BaseURL = srv.URL
+	if cfg.APIKey == "" {
+		cfg.APIKey = "test-key"
+	}
+	if cfg.ModelName == "" {
+		cfg.ModelName = "gpt-test"
+	}
+	m := New(cfg)
 
 	for _, err := range m.GenerateContent(context.Background(), req, false) {
 		if err != nil {
@@ -212,5 +226,33 @@ func TestCustomHTTPClientIsUsed(t *testing.T) {
 	}
 	if transport.hits != 1 {
 		t.Errorf("injected transport hits = %d, want 1", transport.hits)
+	}
+}
+
+// A terminal event whose payload carries malformed function arguments must
+// surface as an error, not degrade into the delta fallback: gateways that
+// omit output_item.done would otherwise silently drop the failure.
+func TestWireBody_StreamMalformedTerminalArguments(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: response.completed\n")
+		io.WriteString(w, `data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_1","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"delete_things","arguments":"{"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	m := New(Config{BaseURL: srv.URL, APIKey: "test-key", ModelName: "gpt-test"})
+
+	req := &model.LLMRequest{Contents: []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+	}}
+	var gotErr error
+	for _, err := range m.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			gotErr = err
+		}
+	}
+	if gotErr == nil {
+		t.Fatalf("expected an error for malformed terminal arguments, got none")
 	}
 }

@@ -270,6 +270,13 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 			case "response.completed", "response.incomplete":
 				resp := &event.Response
 				llmResp, err := convertResponse(resp, m.origin)
+				if err != nil && !errors.Is(err, ErrNoOutputInResponse) {
+					// A malformed terminal payload (e.g. broken function
+					// arguments) is a real error, not a missing-output case;
+					// degrading to the delta fallback would swallow it.
+					yield(nil, err)
+					return
+				}
 				if err != nil || hasNoContent(llmResp) {
 					// The terminal event carried no aggregated output: rebuild the
 					// final response from the accumulated deltas, otherwise ADK
@@ -845,8 +852,10 @@ func convertTools(genaiTools []*genai.Tool) ([]responses.ToolUnionParam, error) 
 
 // --- Helper functions ---
 
-// convertInlineDataToPart converts inline data to the appropriate Responses API content part.
-// Supports images (as data URI) and generic files (PDF, text, audio).
+// convertInlineDataToPart converts inline data to the appropriate Responses
+// API content part. Images become input_image data URIs and documents become
+// input_file data; audio is rejected because the API's file inputs do not
+// accept it.
 func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentUnionParam, error) {
 	if data == nil {
 		return nil, fmt.Errorf("inline data is nil")
@@ -866,26 +875,52 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 			},
 		}, nil
 
-	case mediaType == "application/pdf" || strings.HasPrefix(mediaType, "text/") ||
-		strings.HasPrefix(mediaType, "audio/"):
+	case isDocumentMIMEType(mediaType):
 		return &responses.ResponseInputContentUnionParam{
 			OfInputFile: &responses.ResponseInputFileParam{
 				FileData: param.NewOpt(dataURI),
 			},
 		}, nil
 
+	case strings.HasPrefix(mediaType, "audio/"):
+		// The API's file inputs accept no audio and the SDK's input
+		// content union has no input_audio member, so audio is rejected
+		// instead of being sent as a file the server will refuse.
+		return nil, fmt.Errorf("audio input is not supported by the Responses API adapter: %s", mediaType)
+
 	default:
 		return nil, fmt.Errorf("unsupported inline data MIME type for Responses API: %s", mediaType)
 	}
 }
 
+// isDocumentMIMEType reports whether a media type is in the Responses API's
+// file-input family: PDF, Office and OpenDocument formats, and text (which
+// covers plain text, markdown, HTML, CSV, and source code).
+func isDocumentMIMEType(mediaType string) bool {
+	if strings.HasPrefix(mediaType, "text/") {
+		return true
+	}
+	switch mediaType {
+	case "application/pdf", "application/json", "application/rtf",
+		"application/msword",
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		"application/vnd.ms-excel",
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		"application/vnd.ms-powerpoint",
+		"application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		"application/vnd.oasis.opendocument.text":
+		return true
+	}
+	return false
+}
+
 // convertFileDataToPart maps a FileData part to a content part; the URI goes
-// through verbatim, nothing is downloaded. Images become input_image, PDFs
-// become input_file with file_url; other media types need uploaded bytes
-// (InlineData). Plain http is allowed for API-compatible gateways. Other
-// schemes error instead of being silently dropped; gs://, the scheme
-// genai.FileData documents, gets its own message pointing at InlineData.
-// DisplayName is dropped: neither part has a field for it.
+// through verbatim, nothing is downloaded. Images become input_image and
+// documents become input_file with file_url; audio has no URL transport in
+// the API. Plain http is allowed for API-compatible gateways. Other schemes
+// error instead of being silently dropped; gs://, the scheme genai.FileData
+// documents, gets its own message pointing at InlineData. DisplayName is
+// dropped: neither part has a field for it.
 func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputContentUnionParam, error) {
 	if data == nil {
 		return nil, fmt.Errorf("file data is nil")
@@ -898,8 +933,9 @@ func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputConten
 	}
 
 	mediaType := normalizeMIMEType(data.MIMEType)
-	switch mediaType {
-	case "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp":
+	switch {
+	case mediaType == "image/jpeg" || mediaType == "image/jpg" || mediaType == "image/png" ||
+		mediaType == "image/gif" || mediaType == "image/webp":
 		return &responses.ResponseInputContentUnionParam{
 			OfInputImage: &responses.ResponseInputImageParam{
 				ImageURL: param.NewOpt(data.FileURI),
@@ -907,12 +943,15 @@ func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputConten
 			},
 		}, nil
 
-	case "application/pdf":
+	case isDocumentMIMEType(mediaType):
 		return &responses.ResponseInputContentUnionParam{
 			OfInputFile: &responses.ResponseInputFileParam{
 				FileURL: param.NewOpt(data.FileURI),
 			},
 		}, nil
+
+	case strings.HasPrefix(mediaType, "audio/"):
+		return nil, fmt.Errorf("audio input is not supported by the Responses API adapter: %s", mediaType)
 
 	default:
 		return nil, fmt.Errorf("unsupported file data MIME type for Responses API: %s", mediaType)

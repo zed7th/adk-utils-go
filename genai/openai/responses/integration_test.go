@@ -99,12 +99,22 @@ func sendReal(t *testing.T, body []byte) {
 	}
 }
 
+// testModel returns the model name used for both steps: OPENAI_TEST_MODEL
+// when set, otherwise a real default so the paid step is not guaranteed to
+// fail on an unknown model.
+func testModel() string {
+	if m := os.Getenv("OPENAI_TEST_MODEL"); m != "" {
+		return m
+	}
+	return "gpt-5.5"
+}
+
 // captureWireBody fires one request through the SDK at a local server and
 // returns the raw bytes it put on the wire, so steps A and B validate/send the
 // exact same body the adapter produces.
 func captureWireBody(t *testing.T, req *model.LLMRequest) []byte {
 	t.Helper()
-	body := captureBody(t, req)
+	body := captureBodyFor(t, Config{ModelName: testModel()}, req)
 	raw, err := json.Marshal(body)
 	if err != nil {
 		t.Fatalf("re-marshal captured body: %v", err)
