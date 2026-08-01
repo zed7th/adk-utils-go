@@ -567,3 +567,40 @@ func TestBuildResponseParams_ResponseJsonSchema(t *testing.T) {
 		t.Errorf("minLength = %v, want preserved verbatim", code["minLength"])
 	}
 }
+
+// Refusal content must keep its identity in PartMetadata: replaying it as
+// plain output_text would lose the refusal semantics, and message status
+// must survive so incomplete messages do not come back as completed.
+func TestConvertResponse_RefusalAndStatusMetadata(t *testing.T) {
+	raw := []byte(`{
+		"id": "resp-8",
+		"status": "completed",
+		"output": [{
+			"type": "message",
+			"id": "msg-1",
+			"role": "assistant",
+			"status": "incomplete",
+			"content": [{"type": "refusal", "refusal": "I cannot help with that."}]
+		}],
+		"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+			"input_tokens_details": {"cached_tokens": 0},
+			"output_tokens_details": {"reasoning_tokens": 0}}
+	}`)
+
+	var resp responses.Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	got, err := convertResponse(&resp, "test-origin")
+	if err != nil {
+		t.Fatalf("convertResponse: %v", err)
+	}
+	if len(got.Content.Parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(got.Content.Parts))
+	}
+	pm := got.Content.Parts[0].PartMetadata
+	if pm == nil || pm["refusal"] != true || pm["status"] != "incomplete" || pm["message_id"] != "msg-1" {
+		t.Errorf("PartMetadata = %v, want refusal=true status=incomplete message_id=msg-1", pm)
+	}
+}

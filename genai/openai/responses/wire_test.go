@@ -256,3 +256,52 @@ func TestWireBody_StreamMalformedTerminalArguments(t *testing.T) {
 		t.Fatalf("expected an error for malformed terminal arguments, got none")
 	}
 }
+
+// When a gateway sends complete output_item.done events but a terminal event
+// without aggregated output, the fallback must rebuild the turn from those
+// items: message IDs, phase, and encrypted reasoning survive, instead of
+// degrading to bare delta text.
+func TestWireBody_StreamFallbackPrefersDoneItems(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: response.output_text.delta\n")
+		io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"hello","sequence_number":1}`+"\n\n")
+		io.WriteString(w, "event: response.output_item.done\n")
+		io.WriteString(w, `data: {"type":"response.output_item.done","sequence_number":2,"item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"enc-blob"}}`+"\n\n")
+		io.WriteString(w, "event: response.output_item.done\n")
+		io.WriteString(w, `data: {"type":"response.output_item.done","sequence_number":3,"item":{"type":"message","id":"msg_1","role":"assistant","status":"completed","phase":"final_answer","content":[{"type":"output_text","text":"hello"}]}}`+"\n\n")
+		io.WriteString(w, "event: response.completed\n")
+		io.WriteString(w, `data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	m := New(Config{BaseURL: srv.URL, APIKey: "test-key", ModelName: "gpt-test"})
+
+	var final *model.LLMResponse
+	req := &model.LLMRequest{Contents: []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+	}}
+	for resp, err := range m.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+		if !resp.Partial {
+			final = resp
+		}
+	}
+	if final == nil {
+		t.Fatalf("no final response was yielded")
+	}
+	if len(final.Content.Parts) != 2 {
+		t.Fatalf("expected 2 parts (reasoning + message), got %d: %+v", len(final.Content.Parts), final.Content.Parts)
+	}
+	thought := final.Content.Parts[0]
+	if !thought.Thought || thought.PartMetadata["encrypted_content"] != "enc-blob" {
+		t.Errorf("first part = %+v, want a thought carrying encrypted content", thought)
+	}
+	msg := final.Content.Parts[1]
+	if msg.Text != "hello" || msg.PartMetadata["message_id"] != "msg_1" || msg.PartMetadata["phase"] != "final_answer" {
+		t.Errorf("second part = %+v, want text with message_id and phase", msg)
+	}
+}

@@ -569,3 +569,42 @@ func TestConvertContentToInputItems_MessageIDWithoutPhase(t *testing.T) {
 		t.Errorf("Phase = %q, want empty", msg.Phase)
 	}
 }
+
+// A refusal part must replay as a refusal content part with its message
+// status, not as completed output_text.
+func TestConvertContentToInputItems_RefusalAndStatusReplayed(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text: "I cannot help with that.",
+				PartMetadata: map[string]any{
+					"message_id": "msg_1",
+					"status":     "incomplete",
+					"refusal":    true,
+				},
+			},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	msg := items[0].OfOutputMessage
+	if msg == nil {
+		t.Fatalf("expected an OutputMessage, got %+v", items[0])
+	}
+	if msg.Status != "incomplete" {
+		t.Errorf("Status = %q, want incomplete", msg.Status)
+	}
+	if len(msg.Content) != 1 || msg.Content[0].OfRefusal == nil {
+		t.Fatalf("expected a refusal content part, got %+v", msg.Content)
+	}
+	if msg.Content[0].OfRefusal.Refusal != "I cannot help with that." {
+		t.Errorf("Refusal text = %q", msg.Content[0].OfRefusal.Refusal)
+	}
+}

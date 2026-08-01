@@ -266,6 +266,14 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 						Args: args,
 					})
 				}
+				// Complete items are kept as well: when the terminal event
+				// lacks aggregated output they rebuild the turn with message
+				// IDs, phase, and encrypted reasoning intact, which the bare
+				// delta fallback cannot.
+				switch event.Item.Type {
+				case "message", "reasoning", "function_call":
+					acc.items = append(acc.items, event.Item)
+				}
 
 			case "response.completed", "response.incomplete":
 				resp := &event.Response
@@ -279,12 +287,9 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 				}
 				if err != nil || hasNoContent(llmResp) {
 					// The terminal event carried no aggregated output: rebuild the
-					// final response from the accumulated deltas, otherwise ADK
+					// final response from what the stream delivered, otherwise ADK
 					// would persist an empty event and the turn would be lost.
-					llmResp = acc.finalResponse(
-						convertStatus(resp.Status, resp.IncompleteDetails),
-						convertUsageMetadata(resp.Usage),
-					)
+					llmResp = acc.fallbackResponse(resp, m.origin)
 				}
 				yield(llmResp, nil)
 				return
@@ -310,10 +315,11 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 
 		// The stream ended without any terminal event (some gateways just close
 		// the connection after the last delta). Synthesize the final event from
-		// the accumulated deltas so the turn is persisted and ADK does not raise
+		// what was accumulated so the turn is persisted and ADK does not raise
 		// "last event is not final".
-		if acc.hasContent() {
-			yield(acc.finalResponse(genai.FinishReasonStop, nil), nil)
+		if acc.hasContent() || len(acc.items) > 0 {
+			shadow := responses.Response{Status: responses.ResponseStatusCompleted}
+			yield(acc.fallbackResponse(&shadow, m.origin), nil)
 		}
 	}
 }
@@ -321,11 +327,31 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 // streamAccumulator collects streamed deltas so a complete final response
 // can be rebuilt when the terminal event lacks the aggregated output.
 // reasoning holds the reasoning summary; text holds the final answer;
-// functionCalls holds tool calls completed during the stream.
+// functionCalls holds tool calls completed during the stream; items holds
+// the complete output items from output_item.done events.
 type streamAccumulator struct {
 	reasoning     strings.Builder
 	text          strings.Builder
 	functionCalls []*genai.FunctionCall
+	items         []responses.ResponseOutputItemUnion
+}
+
+// fallbackResponse rebuilds the final turn when the terminal event lacked
+// aggregated output. Complete done items are preferred: they keep message
+// IDs, phase, status, and encrypted reasoning for the next stateless
+// replay. Bare deltas are the last resort.
+func (a *streamAccumulator) fallbackResponse(resp *responses.Response, origin string) *model.LLMResponse {
+	if len(a.items) > 0 {
+		shadow := *resp
+		shadow.Output = a.items
+		if r, err := convertResponse(&shadow, origin); err == nil && !hasNoContent(r) {
+			return r
+		}
+	}
+	return a.finalResponse(
+		convertStatus(resp.Status, resp.IncompleteDetails),
+		convertUsageMetadata(resp.Usage),
+	)
 }
 
 // hasContent reports whether anything was accumulated that could be used to
@@ -536,9 +562,11 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 func convertContentToInputItems(content *genai.Content, origin string) ([]responses.ResponseInputItemUnionParam, error) {
 	var items []responses.ResponseInputItemUnionParam
 	var textParts []string
+	var refusalFlags []bool
 	var mediaParts []responses.ResponseInputContentUnionParam
 	var phase string
 	var messageID string
+	var msgStatus string
 	role := convertRole(content.Role)
 
 	// A replayed reasoning item must be followed by another item from the
@@ -567,15 +595,25 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 		// message, and the API asks for output items to be replayed as-is).
 		if role == responses.EasyInputMessageRoleAssistant && (messageID != "" || phase != "") {
 			var contentParts []responses.ResponseOutputMessageContentUnionParam
-			for _, t := range textParts {
+			for i, t := range textParts {
+				if refusalFlags[i] {
+					contentParts = append(contentParts, responses.ResponseOutputMessageContentUnionParam{
+						OfRefusal: &responses.ResponseOutputRefusalParam{Refusal: t},
+					})
+					continue
+				}
 				contentParts = append(contentParts, responses.ResponseOutputMessageContentUnionParam{
 					OfOutputText: &responses.ResponseOutputTextParam{Text: t},
 				})
 			}
+			status := responses.ResponseOutputMessageStatusCompleted
+			if msgStatus != "" {
+				status = responses.ResponseOutputMessageStatus(msgStatus)
+			}
 			msg := responses.ResponseOutputMessageParam{
 				ID:      messageID,
 				Content: contentParts,
-				Status:  responses.ResponseOutputMessageStatusCompleted,
+				Status:  status,
 				Phase:   responses.ResponseOutputMessagePhase(phase),
 			}
 			items = append(items, responses.ResponseInputItemUnionParam{
@@ -612,9 +650,11 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 		}
 
 		textParts = nil
+		refusalFlags = nil
 		mediaParts = nil
 		phase = ""
 		messageID = ""
+		msgStatus = ""
 	}
 
 	for i, part := range content.Parts {
@@ -698,6 +738,11 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 			}
 			messageID = partID
 			phase = partPhase
+			if s, ok := part.PartMetadata["status"].(string); ok && s != "" {
+				msgStatus = s
+			}
+			refusal, _ := part.PartMetadata["refusal"].(bool)
+			refusalFlags = append(refusalFlags, refusal)
 			textParts = append(textParts, part.Text)
 
 		case part.InlineData != nil:
@@ -761,23 +806,38 @@ func convertResponse(resp *responses.Response, origin string) (*model.LLMRespons
 			})
 
 		case "message":
+			// ID, phase, status, and the refusal flag are kept per part so
+			// the message replays with its identity intact instead of
+			// degrading to plain completed output_text.
+			meta := func(refusal bool) map[string]any {
+				m := map[string]any{}
+				if item.Phase != "" {
+					m["phase"] = string(item.Phase)
+				}
+				if item.ID != "" {
+					m["message_id"] = item.ID
+				}
+				if item.Status != "" {
+					m["status"] = string(item.Status)
+				}
+				if refusal {
+					m["refusal"] = true
+				}
+				if len(m) == 0 {
+					return nil
+				}
+				return m
+			}
 			for _, cp := range item.Content {
 				switch cp.Type {
 				case "output_text":
-					part := &genai.Part{Text: cp.Text}
-					if item.Phase != "" || item.ID != "" {
-						meta := map[string]any{}
-						if item.Phase != "" {
-							meta["phase"] = string(item.Phase)
-						}
-						if item.ID != "" {
-							meta["message_id"] = item.ID
-						}
-						part.PartMetadata = meta
-					}
-					content.Parts = append(content.Parts, part)
+					content.Parts = append(content.Parts, &genai.Part{
+						Text: cp.Text, PartMetadata: meta(false),
+					})
 				case "refusal":
-					content.Parts = append(content.Parts, &genai.Part{Text: cp.Refusal})
+					content.Parts = append(content.Parts, &genai.Part{
+						Text: cp.Refusal, PartMetadata: meta(true),
+					})
 				}
 			}
 
@@ -894,21 +954,31 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 }
 
 // isDocumentMIMEType reports whether a media type is in the Responses API's
-// file-input family: PDF, Office and OpenDocument formats, and text (which
-// covers plain text, markdown, HTML, CSV, and source code).
+// documented file-input family: PDF, Office, OpenDocument, iWork, and Google
+// Docs formats, plus text (plain text, markdown, HTML, CSV, source code) and
+// a few application/* text carriers (JSON, JavaScript, RFC 822 mail).
 func isDocumentMIMEType(mediaType string) bool {
 	if strings.HasPrefix(mediaType, "text/") {
 		return true
 	}
 	switch mediaType {
-	case "application/pdf", "application/json", "application/rtf",
+	case "application/pdf",
+		"application/json", "application/javascript", "application/rtf",
+		"application/csv", "application/x-iif",
+		"message/rfc822",
 		"application/msword",
 		"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 		"application/vnd.ms-excel",
 		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 		"application/vnd.ms-powerpoint",
 		"application/vnd.openxmlformats-officedocument.presentationml.presentation",
-		"application/vnd.oasis.opendocument.text":
+		"application/vnd.oasis.opendocument.text",
+		"application/vnd.apple.pages",
+		"application/vnd.apple.keynote",
+		"application/vnd.apple.iwork",
+		"application/vnd.google-apps.document",
+		"application/vnd.google-apps.spreadsheet",
+		"application/vnd.google-apps.presentation":
 		return true
 	}
 	return false
