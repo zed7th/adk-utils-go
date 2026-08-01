@@ -444,3 +444,51 @@ func TestWireBody_StreamRefusalDelta(t *testing.T) {
 		t.Errorf("part = %+v, want refusal text with refusal metadata", part)
 	}
 }
+
+// A turn with two messages where only the first produced a done event must
+// keep both: the covered message replays from its item (ID and phase
+// intact), and the second message's delta text is merged in rather than
+// masked by the first item's text.
+func TestWireBody_StreamFallbackKeepsUncoveredMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: response.output_text.delta\n")
+		io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"let me look","item_id":"msg_1","output_index":0,"content_index":0,"sequence_number":1}`+"\n\n")
+		io.WriteString(w, "event: response.output_item.done\n")
+		io.WriteString(w, `data: {"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"completed","phase":"commentary","content":[{"type":"output_text","text":"let me look"}]}}`+"\n\n")
+		io.WriteString(w, "event: response.output_text.delta\n")
+		io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"the answer is 4","item_id":"msg_2","output_index":1,"content_index":0,"sequence_number":3}`+"\n\n")
+		io.WriteString(w, "event: response.completed\n")
+		io.WriteString(w, `data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	m := New(Config{BaseURL: srv.URL, APIKey: "test-key", ModelName: "gpt-test"})
+
+	var final *model.LLMResponse
+	req := &model.LLMRequest{Contents: []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+	}}
+	for resp, err := range m.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+		if !resp.Partial {
+			final = resp
+		}
+	}
+	if final == nil {
+		t.Fatalf("no final response was yielded")
+	}
+	if len(final.Content.Parts) != 2 {
+		t.Fatalf("expected 2 parts (done message + uncovered text), got %d: %+v", len(final.Content.Parts), final.Content.Parts)
+	}
+	first := final.Content.Parts[0]
+	if first.Text != "let me look" || first.PartMetadata["message_id"] != "msg_1" || first.PartMetadata["phase"] != "commentary" {
+		t.Errorf("first part = %+v, want the done message with identity", first)
+	}
+	if second := final.Content.Parts[1]; second.Text != "the answer is 4" {
+		t.Errorf("second part = %+v, want the uncovered final answer", second)
+	}
+}

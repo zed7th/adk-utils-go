@@ -27,8 +27,8 @@ func TestStreamAccumulatorFinalResponse(t *testing.T) {
 	var acc streamAccumulator
 	acc.reasoning.WriteString("think first, ")
 	acc.reasoning.WriteString("then answer.")
-	acc.text.WriteString("hello ")
-	acc.text.WriteString("world")
+	acc.addText("", "hello ")
+	acc.addText("", "world")
 
 	resp := acc.finalResponse(genai.FinishReasonStop, nil)
 
@@ -56,7 +56,7 @@ func TestStreamAccumulatorFinalResponse(t *testing.T) {
 // the final response contains a single text part.
 func TestStreamAccumulatorOnlyText(t *testing.T) {
 	var acc streamAccumulator
-	acc.text.WriteString("ok")
+	acc.addText("", "ok")
 
 	resp := acc.finalResponse(genai.FinishReasonStop, nil)
 	if got := len(resp.Content.Parts); got != 1 {
@@ -71,7 +71,7 @@ func TestStreamAccumulatorOnlyText(t *testing.T) {
 // final response: losing a tool call would silently break the agent loop.
 func TestStreamAccumulatorFunctionCalls(t *testing.T) {
 	var acc streamAccumulator
-	acc.text.WriteString("calling the tool")
+	acc.addText("", "calling the tool")
 	acc.functionCalls = append(acc.functionCalls, &genai.FunctionCall{
 		ID:   "call-1",
 		Name: "get_weather",
@@ -103,7 +103,7 @@ func TestStreamAccumulatorHasContent(t *testing.T) {
 	}
 
 	var withText streamAccumulator
-	withText.text.WriteString("x")
+	withText.addText("", "x")
 	if !withText.hasContent() {
 		t.Errorf("text-only accumulator hasContent() = false, want true")
 	}

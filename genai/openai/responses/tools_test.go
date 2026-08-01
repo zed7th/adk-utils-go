@@ -164,6 +164,7 @@ func TestConvertFileDataToPart(t *testing.T) {
 		{"google doc becomes input_file", &genai.FileData{MIMEType: "application/vnd.google-apps.document", FileURI: "https://cdn.example.com/doc"}, "file"},
 		{"typescript becomes input_file", &genai.FileData{MIMEType: "application/typescript", FileURI: "https://cdn.example.com/app.ts"}, "file"},
 		{"yaml becomes input_file", &genai.FileData{MIMEType: "application/yaml", FileURI: "https://cdn.example.com/conf.yaml"}, "file"},
+		{"x-toml becomes input_file", &genai.FileData{MIMEType: "application/x-toml", FileURI: "https://cdn.example.com/conf.toml"}, "file"},
 		{"sql becomes input_file", &genai.FileData{MIMEType: "application/x-sql", FileURI: "https://cdn.example.com/schema.sql"}, "file"},
 		{"audio URL rejected", &genai.FileData{MIMEType: "audio/mpeg", FileURI: "https://cdn.example.com/talk.mp3"}, "error"},
 		{"unsupported", &genai.FileData{MIMEType: "video/mp4", FileURI: fileURI}, "error"},
