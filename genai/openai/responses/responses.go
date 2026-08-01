@@ -223,7 +223,7 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 				if event.Delta == "" {
 					continue
 				}
-				acc.addText(event.ItemID, event.Delta)
+				acc.addText(event.ItemID, event.OutputIndex, event.Delta)
 				llmResp := &model.LLMResponse{
 					Content: &genai.Content{
 						Role:  genai.RoleModel,
@@ -240,7 +240,7 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 				if event.Delta == "" {
 					continue
 				}
-				acc.addRefusal(event.ItemID, event.Delta)
+				acc.addRefusal(event.ItemID, event.OutputIndex, event.Delta)
 				llmResp := &model.LLMResponse{
 					Content: &genai.Content{
 						Role:  genai.RoleModel,
@@ -361,9 +361,11 @@ type streamAccumulator struct {
 	items         []doneItem
 }
 
-// deltaBucket accumulates streamed delta text for one output item.
+// deltaBucket accumulates streamed delta text for one output item; index is
+// the item's output_index, so uncovered buckets merge back in stream order.
 type deltaBucket struct {
 	itemID string
+	index  int64
 	text   strings.Builder
 }
 
@@ -374,24 +376,24 @@ type doneItem struct {
 	item  responses.ResponseOutputItemUnion
 }
 
-func appendDelta(buckets []*deltaBucket, itemID, delta string) []*deltaBucket {
+func appendDelta(buckets []*deltaBucket, itemID string, index int64, delta string) []*deltaBucket {
 	for _, b := range buckets {
 		if b.itemID == itemID {
 			b.text.WriteString(delta)
 			return buckets
 		}
 	}
-	b := &deltaBucket{itemID: itemID}
+	b := &deltaBucket{itemID: itemID, index: index}
 	b.text.WriteString(delta)
 	return append(buckets, b)
 }
 
-func (a *streamAccumulator) addText(itemID, delta string) {
-	a.texts = appendDelta(a.texts, itemID, delta)
+func (a *streamAccumulator) addText(itemID string, index int64, delta string) {
+	a.texts = appendDelta(a.texts, itemID, index, delta)
 }
 
-func (a *streamAccumulator) addRefusal(itemID, delta string) {
-	a.refusals = appendDelta(a.refusals, itemID, delta)
+func (a *streamAccumulator) addRefusal(itemID string, index int64, delta string) {
+	a.refusals = appendDelta(a.refusals, itemID, index, delta)
 }
 
 // joinDeltas concatenates bucket text in arrival order.
@@ -410,18 +412,18 @@ func joinDeltas(buckets []*deltaBucket) string {
 // deltas alone are the last resort.
 func (a *streamAccumulator) fallbackResponse(resp *responses.Response, origin string) *model.LLMResponse {
 	if len(a.items) > 0 {
-		sorted := append([]doneItem{}, a.items...)
-		sort.SliceStable(sorted, func(i, j int) bool {
-			return sorted[i].index < sorted[j].index
+		merged := append(append([]doneItem{}, a.items...), a.uncoveredBuckets()...)
+		sort.SliceStable(merged, func(i, j int) bool {
+			return merged[i].index < merged[j].index
 		})
-		output := make([]responses.ResponseOutputItemUnion, len(sorted))
-		for i, di := range sorted {
+		output := make([]responses.ResponseOutputItemUnion, len(merged))
+		for i, di := range merged {
 			output[i] = di.item
 		}
 		shadow := *resp
 		shadow.Output = output
 		if r, err := convertResponse(&shadow, origin); err == nil && !hasNoContent(r) {
-			a.fillMissingDeltas(r)
+			a.fillMissingReasoning(r)
 			return r
 		}
 	}
@@ -431,69 +433,78 @@ func (a *streamAccumulator) fallbackResponse(resp *responses.Response, origin st
 	)
 }
 
-// fillMissingDeltas merges delta-accumulated content the done items did not
-// cover: a gateway may complete only some items while others streamed as
-// bare deltas, and dropping either side would lose output the consumer
-// already saw. Coverage is decided per item ID; buckets without an ID (a
-// gateway that omits item_id) fall back to a coarse check against any text
-// part the done items produced.
-func (a *streamAccumulator) fillMissingDeltas(r *model.LLMResponse) {
-	hasThought, hasText := false, false
-	for _, p := range r.Content.Parts {
-		switch {
-		case p.Thought:
-			hasThought = true
-		case p.Text != "":
-			hasText = true
-		}
-	}
-	if !hasThought && a.reasoning.Len() > 0 {
-		r.Content.Parts = append(
-			[]*genai.Part{{Text: a.reasoning.String(), Thought: true}},
-			r.Content.Parts...,
-		)
-	}
-
+// uncoveredBuckets turns delta buckets whose item never produced a done
+// event into synthetic message items: a gateway may complete only some
+// items while others streamed as bare deltas, and dropping either side
+// would lose output the consumer already saw. Sorting the result with the
+// done items by output_index restores the stream order. Buckets without an
+// item ID (a gateway that omits item_id) fall back to a coarse check
+// against any text the done message items carry.
+func (a *streamAccumulator) uncoveredBuckets() []doneItem {
 	doneMessageIDs := map[string]bool{}
+	doneHasText := false
 	for _, di := range a.items {
-		if di.item.Type == "message" && di.item.ID != "" {
+		if di.item.Type != "message" {
+			continue
+		}
+		if di.item.ID != "" {
 			doneMessageIDs[di.item.ID] = true
+		}
+		for _, cp := range di.item.Content {
+			if cp.Text != "" || cp.Refusal != "" {
+				doneHasText = true
+			}
 		}
 	}
 	covered := func(b *deltaBucket) bool {
 		if b.itemID == "" {
-			return hasText
+			return doneHasText
 		}
 		return doneMessageIDs[b.itemID]
 	}
-	var fill []*genai.Part
+
+	var synthetic []doneItem
 	for _, b := range a.texts {
 		if !covered(b) {
-			fill = append(fill, &genai.Part{Text: b.text.String()})
+			synthetic = append(synthetic, doneItem{index: b.index, item: responses.ResponseOutputItemUnion{
+				Type:    "message",
+				ID:      b.itemID,
+				Role:    "assistant",
+				Status:  "completed",
+				Content: []responses.ResponseOutputMessageContentUnion{{Type: "output_text", Text: b.text.String()}},
+			}})
 		}
 	}
 	for _, b := range a.refusals {
 		if !covered(b) {
-			fill = append(fill, &genai.Part{
-				Text:         b.text.String(),
-				PartMetadata: map[string]any{"refusal": true},
-			})
+			synthetic = append(synthetic, doneItem{index: b.index, item: responses.ResponseOutputItemUnion{
+				Type:    "message",
+				ID:      b.itemID,
+				Role:    "assistant",
+				Status:  "completed",
+				Content: []responses.ResponseOutputMessageContentUnion{{Type: "refusal", Refusal: b.text.String()}},
+			}})
 		}
 	}
-	if len(fill) > 0 {
-		// Uncovered text goes before any function calls, matching the
-		// temporal order in which the parts streamed.
-		idx := len(r.Content.Parts)
-		for i, p := range r.Content.Parts {
-			if p.FunctionCall != nil {
-				idx = i
-				break
-			}
-		}
-		parts := append([]*genai.Part{}, r.Content.Parts[:idx]...)
-		parts = append(parts, fill...)
-		r.Content.Parts = append(parts, r.Content.Parts[idx:]...)
+	return synthetic
+}
+
+// fillMissingReasoning prepends the delta reasoning summary when the done
+// items did not include a reasoning item, so streamed thoughts are not
+// dropped from the persisted turn.
+func (a *streamAccumulator) fillMissingReasoning(r *model.LLMResponse) {
+	if a.reasoning.Len() == 0 {
+		return
 	}
+	for _, p := range r.Content.Parts {
+		if p.Thought {
+			return
+		}
+	}
+	r.Content.Parts = append(
+		[]*genai.Part{{Text: a.reasoning.String(), Thought: true}},
+		r.Content.Parts...,
+	)
 }
 
 // hasContent reports whether anything was accumulated that could be used to
