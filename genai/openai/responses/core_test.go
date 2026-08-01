@@ -511,3 +511,96 @@ func TestNormalizeStrictSchema_NullableConvertsToNullUnion(t *testing.T) {
 		t.Errorf("tag type = %v, want string (nullable false adds nothing)", tag["type"])
 	}
 }
+
+// The strict validator rejects a $ref with sibling keys. The reference
+// hoists into a single-branch anyOf with the siblings kept on the node; a
+// bare $ref stays untouched; combining $ref with a union goes non-strict
+// because the conjunction cannot be expressed faithfully.
+func TestNormalizeStrictSchema_RefWithSiblings(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"target": map[string]any{"$ref": "#/$defs/target", "description": "what to hit"},
+			"backup": map[string]any{"$ref": "#/$defs/target"},
+		},
+		"required": []any{"target", "backup"},
+		"$defs": map[string]any{
+			"target": map[string]any{"type": "string"},
+		},
+	}
+
+	normalizeStrictSchema(schema)
+
+	props := schema["properties"].(map[string]any)
+	target := props["target"].(map[string]any)
+	if _, ok := target["$ref"]; ok {
+		t.Errorf("$ref with siblings survived at top level: %+v", target)
+	}
+	if target["description"] != "what to hit" {
+		t.Errorf("description lost: %+v", target)
+	}
+	branches, _ := target["anyOf"].([]any)
+	if len(branches) != 1 || branches[0].(map[string]any)["$ref"] != "#/$defs/target" {
+		t.Errorf("anyOf = %+v, want a single $ref branch", target["anyOf"])
+	}
+	backup := props["backup"].(map[string]any)
+	if backup["$ref"] != "#/$defs/target" || len(backup) != 1 {
+		t.Errorf("bare $ref should stay untouched, got %+v", backup)
+	}
+}
+
+// An optional $ref property with siblings must end up nullable and keep its
+// annotations: the hoisted anyOf gains a null branch.
+func TestNormalizeStrictSchema_OptionalRefWithSiblings(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"target": map[string]any{"$ref": "#/$defs/target", "description": "what to hit"},
+		},
+		"$defs": map[string]any{
+			"target": map[string]any{"type": "string"},
+		},
+	}
+
+	normalizeStrictSchema(schema)
+
+	target := schema["properties"].(map[string]any)["target"].(map[string]any)
+	if target["description"] != "what to hit" {
+		t.Errorf("description lost: %+v", target)
+	}
+	branches, _ := target["anyOf"].([]any)
+	if len(branches) != 2 {
+		t.Fatalf("anyOf = %+v, want $ref branch plus null branch", target["anyOf"])
+	}
+	if branches[0].(map[string]any)["$ref"] != "#/$defs/target" {
+		t.Errorf("first branch = %+v, want the $ref", branches[0])
+	}
+	if branches[1].(map[string]any)["type"] != "null" {
+		t.Errorf("second branch = %+v, want null", branches[1])
+	}
+}
+
+// $ref combined with a union is a conjunction the strict subset cannot
+// express, so the whole tool goes non-strict instead of being rewritten.
+func TestConvertFunctionParams_RefWithUnionGoesNonStrict(t *testing.T) {
+	params := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"target": map[string]any{
+				"$ref":  "#/$defs/a",
+				"anyOf": []any{map[string]any{"type": "string"}},
+			},
+		},
+		"$defs": map[string]any{
+			"a": map[string]any{"type": "string"},
+		},
+	}
+
+	schemaMap, strict := convertFunctionParams(params)
+	if schemaMap == nil {
+		t.Fatalf("conversion failed")
+	}
+	if strict {
+		t.Errorf("strict = true, want false for a $ref+union conjunction")
+	}
+}

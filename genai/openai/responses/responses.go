@@ -1363,6 +1363,17 @@ func fitsStrictSubset(schema map[string]any) bool {
 		return false
 	}
 
+	// A $ref next to anyOf or oneOf is a conjunction the strict subset
+	// cannot express: hoisting the reference into the union would change
+	// what the schema accepts, so such nodes go non-strict.
+	if _, ok := schema["$ref"]; ok {
+		for _, key := range []string{"anyOf", "oneOf"} {
+			if _, exists := schema[key]; exists {
+				return false
+			}
+		}
+	}
+
 	if isArraySchema(schema) {
 		if _, ok := schema["items"]; !ok {
 			return false
@@ -1514,6 +1525,18 @@ func normalizeStrictSchema(schema map[string]any) {
 		}
 		delete(schema, "oneOf")
 	}
+
+	// The strict validator rejects a $ref with sibling keys, so the
+	// reference moves into a single-branch anyOf while the siblings stay
+	// on the node: annotations and constraints keep applying alongside
+	// the reference instead of being dropped.
+	if ref, ok := schema["$ref"]; ok && len(schema) > 1 {
+		if _, exists := schema["anyOf"]; !exists {
+			delete(schema, "$ref")
+			schema["anyOf"] = []any{map[string]any{"$ref": ref}}
+		}
+	}
+
 	if branches, ok := schema["anyOf"].([]any); ok {
 		for _, branch := range branches {
 			if branchMap, ok := branch.(map[string]any); ok {
