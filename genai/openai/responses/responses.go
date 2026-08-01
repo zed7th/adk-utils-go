@@ -42,7 +42,7 @@
 // dropped and the turn degrades gracefully to fresh reasoning.
 //
 // For OpenAI-compatible gateways (Ollama, vLLM, DeepSeek, Kimi, etc.) that only
-// expose the Chat Completions endpoint, use the genai/openai package instead.
+// expose the Chat Completions endpoint, use the parent openai package instead.
 package responses
 
 import (
@@ -193,8 +193,8 @@ func (m *Model) generate(ctx context.Context, req *model.LLMRequest) iter.Seq2[*
 // from response.completed, or close the connection without any terminal event
 // at all. Relying solely on the server-provided output then yields an empty
 // final event, so the assistant turn is lost from history on reload even though
-// it streamed fine. To stay robust, the deltas are accumulated locally as a
-// fallback, mirroring the Chat Completions adapter.
+// it streamed fine. As a fallback the deltas are accumulated locally,
+// mirroring the Chat Completions adapter.
 func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
 		params, err := m.buildResponseParams(req)
@@ -362,14 +362,14 @@ func (m *Model) buildResponseParams(req *model.LLMRequest) (responses.ResponseNe
 		},
 	}
 
-	// System instruction → instructions field
+	// The system instruction maps to the instructions field.
 	if req.Config != nil && req.Config.SystemInstruction != nil {
 		if text := extractText(req.Config.SystemInstruction); text != "" {
 			params.Instructions = param.NewOpt(text)
 		}
 	}
 
-	// Conversation history → input items
+	// The conversation history maps to input items.
 	var input responses.ResponseInputParam
 	for _, content := range req.Contents {
 		items, err := convertContentToInputItems(content, m.origin)
@@ -452,7 +452,7 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 		params.Tools = tools
 	}
 
-	// ToolConfig → tool_choice
+	// ToolConfig maps to tool_choice.
 	if cfg.ToolConfig != nil && cfg.ToolConfig.FunctionCallingConfig != nil {
 		fcc := cfg.ToolConfig.FunctionCallingConfig
 		switch fcc.Mode {
@@ -514,7 +514,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 			return
 		}
 
-		// Model output with phase metadata → build OutputMessage manually to
+		// Model output with phase metadata builds an OutputMessage manually to
 		// preserve the phase field for GPT-5.3-Codex+ round-tripping.
 		if role == responses.EasyInputMessageRoleAssistant && phase != "" {
 			var contentParts []responses.ResponseOutputMessageContentUnionParam
@@ -1144,7 +1144,7 @@ func normalizeStrictSchema(schema map[string]any) {
 	schema["required"] = allKeys
 }
 
-// isObjectSchema returns true if the schema represents an object — either
+// isObjectSchema returns true if the schema represents an object, either
 // by explicit type or by having a "properties" field (common in dynamically
 // registered tools that omit "type").
 func isObjectSchema(schema map[string]any) bool {
