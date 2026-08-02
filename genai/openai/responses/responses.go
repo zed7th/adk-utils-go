@@ -1329,11 +1329,54 @@ func convertFunctionParams(params any) (map[string]any, bool) {
 		return nil, false
 	}
 	lowercaseTypes(m)
+	m = inlineRootRef(m)
+	// Strict mode requires the root to be a plain object: a root that is
+	// still a $ref, an array, or a union goes non-strict as-is.
+	if !isObjectSchema(m) {
+		return m, false
+	}
 	if !fitsStrictSubset(m) {
 		return m, false
 	}
 	normalizeStrictSchema(m)
 	return m, true
+}
+
+// inlineRootRef resolves the root-level "$ref plus $defs" shape that Go
+// schema generators commonly emit. Strict mode wants the root to be a plain
+// object, so the referenced definition's keys are copied onto the root and
+// $defs stays for the remaining references. Roots with extra siblings or an
+// unresolvable pointer come back unchanged and fail the object check.
+func inlineRootRef(m map[string]any) map[string]any {
+	ref, ok := m["$ref"].(string)
+	if !ok {
+		return m
+	}
+	for key := range m {
+		if key != "$ref" && key != "$defs" {
+			return m
+		}
+	}
+	name, found := strings.CutPrefix(ref, "#/$defs/")
+	if !found || strings.Contains(name, "/") {
+		return m
+	}
+	defs, _ := m["$defs"].(map[string]any)
+	target, ok := defs[name].(map[string]any)
+	if !ok {
+		return m
+	}
+	if _, hasOwnDefs := target["$defs"]; hasOwnDefs {
+		return m
+	}
+	// The target is copied so the root and the $defs entry do not share
+	// maps during normalization.
+	root := deepCopySchema(target)
+	if root == nil {
+		return m
+	}
+	root["$defs"] = defs
+	return root
 }
 
 // unsupportedStrictKeywords are schema keywords the strict subset rejects and

@@ -604,3 +604,79 @@ func TestConvertFunctionParams_RefWithUnionGoesNonStrict(t *testing.T) {
 		t.Errorf("strict = true, want false for a $ref+union conjunction")
 	}
 }
+
+// Go schema generators commonly emit a root-level $ref pointing into $defs.
+// Strict mode wants a plain object root, so the reference inlines; shapes
+// that cannot inline faithfully go non-strict instead of reaching the API
+// as a root anyOf or a root $ref, which strict mode rejects.
+func TestConvertFunctionParams_RootRef(t *testing.T) {
+	t.Run("root ref with defs inlines and stays strict", func(t *testing.T) {
+		params := map[string]any{
+			"$ref": "#/$defs/args",
+			"$defs": map[string]any{
+				"args": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"query": map[string]any{"type": "string"},
+						"child": map[string]any{"$ref": "#/$defs/args"},
+					},
+					"required": []any{"query"},
+				},
+			},
+		}
+
+		schemaMap, strict := convertFunctionParams(params)
+		if !strict {
+			t.Fatalf("strict = false, want true for an inlinable root ref")
+		}
+		if _, ok := schemaMap["$ref"]; ok {
+			t.Errorf("root $ref survived: %+v", schemaMap)
+		}
+		if _, ok := schemaMap["anyOf"]; ok {
+			t.Errorf("root anyOf is rejected by strict mode: %+v", schemaMap)
+		}
+		if schemaMap["type"] != "object" {
+			t.Errorf("root type = %v, want object", schemaMap["type"])
+		}
+		if _, ok := schemaMap["$defs"].(map[string]any); !ok {
+			t.Errorf("$defs lost from the root: %+v", schemaMap)
+		}
+		props, _ := schemaMap["properties"].(map[string]any)
+		if _, ok := props["query"]; !ok {
+			t.Errorf("inlined properties missing: %+v", schemaMap)
+		}
+	})
+
+	t.Run("root ref with extra siblings goes non-strict", func(t *testing.T) {
+		params := map[string]any{
+			"$ref":        "#/$defs/args",
+			"description": "tool arguments",
+			"$defs": map[string]any{
+				"args": map[string]any{"type": "object"},
+			},
+		}
+		if _, strict := convertFunctionParams(params); strict {
+			t.Errorf("strict = true, want false for a root ref with extra siblings")
+		}
+	})
+
+	t.Run("unresolvable root ref goes non-strict", func(t *testing.T) {
+		params := map[string]any{
+			"$ref":  "#/definitions/args",
+			"$defs": map[string]any{"args": map[string]any{"type": "object"}},
+		}
+		if _, strict := convertFunctionParams(params); strict {
+			t.Errorf("strict = true, want false for an unresolvable root ref")
+		}
+	})
+
+	t.Run("non-object root goes non-strict", func(t *testing.T) {
+		params := map[string]any{
+			"type":  "array",
+			"items": map[string]any{"type": "string"},
+		}
+		if _, strict := convertFunctionParams(params); strict {
+			t.Errorf("strict = true, want false for a non-object root")
+		}
+	})
+}
