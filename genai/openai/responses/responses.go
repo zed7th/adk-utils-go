@@ -811,9 +811,16 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 		} else {
 			// Only the message ID has no field on this path; the phase does
 			// (models like gpt-5.3-codex expect it back), so it is kept.
+			// Phase is assistant-only: multi-agent histories relabel other
+			// agents' output as user while keeping part metadata, and the
+			// API rejects phase on user messages.
+			msgPhase := responses.EasyInputMessagePhase("")
+			if role == responses.EasyInputMessageRoleAssistant {
+				msgPhase = responses.EasyInputMessagePhase(phase)
+			}
 			items = append(items, responses.ResponseInputItemUnionParam{
 				OfMessage: &responses.EasyInputMessageParam{
-					Phase: responses.EasyInputMessagePhase(phase),
+					Phase: msgPhase,
 					Content: responses.EasyInputMessageContentUnionParam{
 						OfInputItemContentList: orderedContents,
 					},
@@ -905,9 +912,12 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 			// flushing on a message_id or phase change keeps each replayed
 			// message's identity and phase intact (models like
 			// gpt-5.3-codex expect commentary and final answer separate).
+			// Only buffered text marks a boundary: identity comes from text
+			// parts alone, so a media-only prefix has none yet and adopts
+			// the incoming identity instead of splitting off the media.
 			partID, _ := part.PartMetadata["message_id"].(string)
 			partPhase, _ := part.PartMetadata["phase"].(string)
-			if (len(textParts) > 0 || len(mediaParts) > 0) &&
+			if len(textParts) > 0 &&
 				(partID != messageID || partPhase != phase) {
 				flushMessage()
 			}
@@ -1278,7 +1288,7 @@ func extensionForMIME(mediaType string) string {
 		return "md"
 	case "application/javascript", "text/javascript":
 		return "js"
-	case "application/typescript":
+	case "application/typescript", "text/x-typescript":
 		return "ts"
 	case "text/x-python", "text/x-script.python":
 		return "py"
@@ -1292,9 +1302,9 @@ func extensionForMIME(mediaType string) string {
 		return "go"
 	case "text/x-ruby":
 		return "rb"
-	case "text/x-rust":
+	case "text/x-rust", "application/x-rust":
 		return "rs"
-	case "text/x-shellscript":
+	case "text/x-shellscript", "application/x-bash":
 		return "sh"
 	case "text/x-perl":
 		return "pl"
