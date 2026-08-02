@@ -1331,9 +1331,16 @@ func convertFunctionParams(params any) (map[string]any, bool) {
 	lowercaseTypes(m)
 	m = inlineRootRef(m)
 	// Strict mode requires the root to be a plain object: a root that is
-	// still a $ref, an array, or a union goes non-strict as-is.
+	// still a $ref, an array, or a union goes non-strict as-is. anyOf and
+	// oneOf are both checked because normalization would rename a root
+	// oneOf into the anyOf the API rejects at the root.
 	if !isObjectSchema(m) {
 		return m, false
+	}
+	for _, key := range []string{"anyOf", "oneOf"} {
+		if _, ok := m[key]; ok {
+			return m, false
+		}
 	}
 	if !fitsStrictSubset(m) {
 		return m, false

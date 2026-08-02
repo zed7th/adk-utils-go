@@ -680,3 +680,43 @@ func TestConvertFunctionParams_RootRef(t *testing.T) {
 		}
 	})
 }
+
+// The API rejects anyOf at the root of a strict schema, and a root oneOf
+// would be renamed into exactly that during normalization. Both go
+// non-strict, whether written directly or reached by inlining a root $ref.
+func TestConvertFunctionParams_RootUnionGoesNonStrict(t *testing.T) {
+	t.Run("direct root anyOf", func(t *testing.T) {
+		params := map[string]any{
+			"type": "object",
+			"anyOf": []any{
+				map[string]any{"required": []any{"a"}},
+			},
+			"properties": map[string]any{"a": map[string]any{"type": "string"}},
+		}
+		m, strict := convertFunctionParams(params)
+		if strict {
+			t.Errorf("strict = true, want false for a root anyOf")
+		}
+		if m["anyOf"] == nil {
+			t.Errorf("non-strict schema should pass through unchanged: %+v", m)
+		}
+	})
+
+	t.Run("root oneOf reached through an inlined ref", func(t *testing.T) {
+		params := map[string]any{
+			"$ref": "#/$defs/args",
+			"$defs": map[string]any{
+				"args": map[string]any{
+					"type": "object",
+					"oneOf": []any{
+						map[string]any{"properties": map[string]any{"a": map[string]any{"type": "string"}}},
+					},
+					"properties": map[string]any{"a": map[string]any{"type": "string"}},
+				},
+			},
+		}
+		if _, strict := convertFunctionParams(params); strict {
+			t.Errorf("strict = true, want false for an inlined root oneOf")
+		}
+	})
+}
