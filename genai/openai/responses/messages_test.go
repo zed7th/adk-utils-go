@@ -608,3 +608,37 @@ func TestConvertContentToInputItems_RefusalAndStatusReplayed(t *testing.T) {
 		t.Errorf("Refusal text = %q", msg.Content[0].OfRefusal.Refusal)
 	}
 }
+
+// Interleaved text and media must keep their original order: regrouping
+// them would change which image a "describe the above" refers to.
+func TestConvertContentToInputItems_InterleavedOrderPreserved(t *testing.T) {
+	content := &genai.Content{
+		Role: "user",
+		Parts: []*genai.Part{
+			{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte("a")}},
+			{Text: "describe the image above"},
+			{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte("b")}},
+			{Text: "now compare both"},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	contents := items[0].OfMessage.Content.OfInputItemContentList
+	if len(contents) != 4 {
+		t.Fatalf("expected 4 content parts, got %d", len(contents))
+	}
+	wantKinds := []string{"image", "text", "image", "text"}
+	for i, want := range wantKinds {
+		isImage := contents[i].OfInputImage != nil
+		isText := contents[i].OfInputText != nil
+		if (want == "image") != isImage || (want == "text") != isText {
+			t.Errorf("content[%d]: want %s, got image=%v text=%v", i, want, isImage, isText)
+		}
+	}
+}

@@ -179,3 +179,15 @@ func TestParseJSONArgs(t *testing.T) {
 		})
 	}
 }
+
+// A literal "null" is well-formed JSON some gateways emit for parameterless
+// calls: it means no arguments, not a malformed payload.
+func TestParseJSONArgs_NullMeansNoArguments(t *testing.T) {
+	got, err := parseJSONArgs("null")
+	if err != nil {
+		t.Fatalf("parseJSONArgs(null): %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Errorf("parseJSONArgs(null) = %#v, want a non-nil empty map", got)
+	}
+}

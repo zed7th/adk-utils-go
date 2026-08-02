@@ -638,14 +638,20 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 		if err != nil {
 			return fmt.Errorf("failed to convert response schema: %w", err)
 		}
-		normalizeStrictSchema(schemaMap)
+		// Strict mode requires an object root; a primitive or array root
+		// (which the typed schema allows) goes non-strict instead of
+		// building a request the API rejects.
+		strict := isObjectSchema(schemaMap)
+		if strict {
+			normalizeStrictSchema(schemaMap)
+		}
 		params.Text = responses.ResponseTextConfigParam{
 			Format: responses.ResponseFormatTextConfigUnionParam{
 				OfJSONSchema: &responses.ResponseFormatTextJSONSchemaConfigParam{
 					Name:        "response",
 					Description: param.NewOpt(cfg.ResponseSchema.Description),
 					Schema:      schemaMap,
-					Strict:      param.NewOpt(true),
+					Strict:      param.NewOpt(strict),
 				},
 			},
 		}
@@ -724,6 +730,10 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 	var textParts []string
 	var refusalFlags []bool
 	var mediaParts []responses.ResponseInputContentUnionParam
+	// orderedContents keeps text and media in their original interleaved
+	// order for mixed messages; regrouping them would change the prompt
+	// (e.g. which image a "describe the above" refers to).
+	var orderedContents responses.ResponseInputMessageContentListParam
 	var phase string
 	var messageID string
 	var msgStatus string
@@ -793,15 +803,10 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 				},
 			})
 		} else {
-			var contentList responses.ResponseInputMessageContentListParam
-			for _, t := range textParts {
-				contentList = append(contentList, responses.ResponseInputContentParamOfInputText(t))
-			}
-			contentList = append(contentList, mediaParts...)
 			items = append(items, responses.ResponseInputItemUnionParam{
 				OfMessage: &responses.EasyInputMessageParam{
 					Content: responses.EasyInputMessageContentUnionParam{
-						OfInputItemContentList: contentList,
+						OfInputItemContentList: orderedContents,
 					},
 					Role: role,
 					Type: responses.EasyInputMessageTypeMessage,
@@ -812,6 +817,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 		textParts = nil
 		refusalFlags = nil
 		mediaParts = nil
+		orderedContents = nil
 		phase = ""
 		messageID = ""
 		msgStatus = ""
@@ -904,6 +910,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 			refusal, _ := part.PartMetadata["refusal"].(bool)
 			refusalFlags = append(refusalFlags, refusal)
 			textParts = append(textParts, part.Text)
+			orderedContents = append(orderedContents, responses.ResponseInputContentParamOfInputText(part.Text))
 
 		case part.InlineData != nil:
 			p, err := convertInlineDataToPart(part.InlineData)
@@ -911,6 +918,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 				return nil, err
 			}
 			mediaParts = append(mediaParts, *p)
+			orderedContents = append(orderedContents, *p)
 
 		case part.FileData != nil:
 			p, err := convertFileDataToPart(part.FileData)
@@ -918,6 +926,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 				return nil, err
 			}
 			mediaParts = append(mediaParts, *p)
+			orderedContents = append(orderedContents, *p)
 		}
 	}
 
@@ -930,6 +939,19 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 // alongside encrypted reasoning content so replay can be restricted to the
 // same channel.
 func convertResponse(resp *responses.Response, origin string) (*model.LLMResponse, error) {
+	// A failed response is an error, mirroring the streaming response.failed
+	// handling: without this check the server's message would degrade into
+	// "no output items", or partial output would pass as a completed turn.
+	if resp.Status == responses.ResponseStatusFailed {
+		msg := resp.Error.Message
+		if msg == "" {
+			msg = string(resp.Error.Code)
+		}
+		if msg == "" {
+			msg = "response generation failed"
+		}
+		return nil, fmt.Errorf("openai responses api: %s", msg)
+	}
 	if len(resp.Output) == 0 {
 		return nil, ErrNoOutputInResponse
 	}
@@ -1096,9 +1118,17 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 		}, nil
 
 	case isDocumentMIMEType(mediaType):
+		// Base64 file uploads need a filename: the API identifies the
+		// document type by its extension. The caller's DisplayName wins,
+		// with a stable MIME-derived fallback.
+		filename := data.DisplayName
+		if filename == "" {
+			filename = filenameForMIME(mediaType)
+		}
 		return &responses.ResponseInputContentUnionParam{
 			OfInputFile: &responses.ResponseInputFileParam{
 				FileData: param.NewOpt(dataURI),
+				Filename: param.NewOpt(filename),
 			},
 		}, nil
 
@@ -1216,6 +1246,60 @@ func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputConten
 	default:
 		return nil, fmt.Errorf("unsupported file data MIME type for Responses API: %s", mediaType)
 	}
+}
+
+// filenameForMIME derives a stable filename for base64 file uploads. Types
+// whose subtype is not a usable extension are mapped explicitly; the rest
+// use the subtype with "x-" and "vnd." prefixes stripped.
+func filenameForMIME(mediaType string) string {
+	switch mediaType {
+	case "text/plain":
+		return "input.txt"
+	case "text/markdown":
+		return "input.md"
+	case "application/javascript", "text/javascript":
+		return "input.js"
+	case "application/typescript":
+		return "input.ts"
+	case "message/rfc822":
+		return "input.eml"
+	case "application/msword":
+		return "input.doc"
+	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+		return "input.docx"
+	case "application/vnd.ms-excel":
+		return "input.xls"
+	case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+		return "input.xlsx"
+	case "application/vnd.ms-powerpoint":
+		return "input.ppt"
+	case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+		return "input.pptx"
+	case "application/vnd.oasis.opendocument.text":
+		return "input.odt"
+	case "application/vnd.apple.pages":
+		return "input.pages"
+	case "application/vnd.apple.keynote":
+		return "input.key"
+	case "application/x-ndjson":
+		return "input.ndjson"
+	case "application/x-subrip":
+		return "input.srt"
+	case "application/x-httpd-php", "application/x-httpd-php-source":
+		return "input.php"
+	case "application/x-protobuf":
+		return "input.proto"
+	case "application/x-terraform":
+		return "input.tf"
+	case "application/x-powershell":
+		return "input.ps1"
+	case "application/graphql", "application/x-graphql":
+		return "input.graphql"
+	}
+	sub := mediaType[strings.LastIndexByte(mediaType, '/')+1:]
+	sub = strings.TrimPrefix(sub, "x-")
+	sub = strings.TrimPrefix(sub, "vnd.")
+	return "input." + sub
 }
 
 // normalizeMIMEType strips parameters from a MIME string ("image/png;
@@ -1879,7 +1963,9 @@ func joinTexts(texts []string) string {
 
 // parseJSONArgs parses a function-call arguments string into a map. Malformed
 // JSON is an error, not an empty map: a tool with side effects must not run
-// with silently emptied arguments.
+// with silently emptied arguments. A literal "null" is well-formed JSON some
+// gateways emit for parameterless calls; like the empty string it means no
+// arguments.
 func parseJSONArgs(argsJSON string) (map[string]any, error) {
 	if argsJSON == "" {
 		return make(map[string]any), nil
@@ -1887,6 +1973,9 @@ func parseJSONArgs(argsJSON string) (map[string]any, error) {
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return nil, fmt.Errorf("malformed function call arguments %q: %w", argsJSON, err)
+	}
+	if args == nil {
+		return make(map[string]any), nil
 	}
 	return args, nil
 }

@@ -538,3 +538,38 @@ func TestWireBody_StreamFallbackOrdersUncoveredMessage(t *testing.T) {
 		t.Errorf("second part = %+v, want the done message", second)
 	}
 }
+
+// Base64 documents must reach the wire with both file_data and a filename:
+// the API identifies the document type by the extension.
+func TestWireBody_InlineDocumentCarriesFilename(t *testing.T) {
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{
+				{Text: "summarize this"},
+				{InlineData: &genai.Blob{MIMEType: "application/pdf", Data: []byte("fake-pdf")}},
+			}},
+		},
+	}
+
+	body := captureBody(t, req)
+
+	input, _ := body["input"].([]any)
+	if len(input) != 1 {
+		t.Fatalf("input items = %d, want 1", len(input))
+	}
+	msg, _ := input[0].(map[string]any)
+	contents, _ := msg["content"].([]any)
+	if len(contents) != 2 {
+		t.Fatalf("content parts = %d, want 2", len(contents))
+	}
+	file, _ := contents[1].(map[string]any)
+	if file["type"] != "input_file" {
+		t.Fatalf("second part = %v, want input_file", file)
+	}
+	if file["filename"] != "input.pdf" {
+		t.Errorf("filename = %v, want input.pdf", file["filename"])
+	}
+	if data, _ := file["file_data"].(string); data == "" {
+		t.Errorf("file_data missing from the wire body")
+	}
+}

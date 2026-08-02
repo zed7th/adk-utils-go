@@ -231,3 +231,44 @@ func TestConvertTools_UnsupportedFacetsError(t *testing.T) {
 		t.Fatalf("expected an error for a GoogleSearch tool, got none")
 	}
 }
+
+// Base64 documents must carry a filename: the API identifies the document
+// type by its extension. DisplayName wins when the caller set one.
+func TestConvertInlineDataToPart_DocumentFilename(t *testing.T) {
+	pdf, err := convertInlineDataToPart(&genai.Blob{MIMEType: "application/pdf", Data: []byte("x")})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := pdf.OfInputFile.Filename.Value; got != "input.pdf" {
+		t.Errorf("Filename = %q, want input.pdf", got)
+	}
+
+	named, err := convertInlineDataToPart(&genai.Blob{
+		MIMEType: "text/csv", Data: []byte("x"), DisplayName: "report.csv",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := named.OfInputFile.Filename.Value; got != "report.csv" {
+		t.Errorf("Filename = %q, want the caller's DisplayName", got)
+	}
+}
+
+// filenameForMIME maps explicit cases and falls back to the stripped
+// subtype for the rest.
+func TestFilenameForMIME(t *testing.T) {
+	cases := map[string]string{
+		"text/plain": "input.txt",
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document": "input.docx",
+		"application/x-sql":  "input.sql",
+		"application/json":   "input.json",
+		"text/csv":           "input.csv",
+		"application/x-yaml": "input.yaml",
+		"message/rfc822":     "input.eml",
+	}
+	for mime, want := range cases {
+		if got := filenameForMIME(mime); got != want {
+			t.Errorf("filenameForMIME(%q) = %q, want %q", mime, got, want)
+		}
+	}
+}
