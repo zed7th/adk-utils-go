@@ -608,3 +608,141 @@ func TestConvertContentToInputItems_RefusalAndStatusReplayed(t *testing.T) {
 		t.Errorf("Refusal text = %q", msg.Content[0].OfRefusal.Refusal)
 	}
 }
+
+// Interleaved text and media must keep their original order: regrouping
+// them would change which image a "describe the above" refers to.
+func TestConvertContentToInputItems_InterleavedOrderPreserved(t *testing.T) {
+	content := &genai.Content{
+		Role: "user",
+		Parts: []*genai.Part{
+			{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte("a")}},
+			{Text: "describe the image above"},
+			{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte("b")}},
+			{Text: "now compare both"},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	contents := items[0].OfMessage.Content.OfInputItemContentList
+	if len(contents) != 4 {
+		t.Fatalf("expected 4 content parts, got %d", len(contents))
+	}
+	wantKinds := []string{"image", "text", "image", "text"}
+	for i, want := range wantKinds {
+		isImage := contents[i].OfInputImage != nil
+		isText := contents[i].OfInputText != nil
+		if (want == "image") != isImage || (want == "text") != isText {
+			t.Errorf("content[%d]: want %s, got image=%v text=%v", i, want, isImage, isText)
+		}
+	}
+}
+
+// An identity-bearing assistant message that also holds media keeps the
+// media through the content-list path: output message content cannot carry
+// media, and dropping parts silently would change the prompt.
+func TestConvertContentToInputItems_IdentityWithMediaKeepsMedia(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text:         "here is the image",
+				PartMetadata: map[string]any{"message_id": "msg_1", "phase": "final_answer"},
+			},
+			{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte("x")}},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	msg := items[0].OfMessage
+	if msg == nil {
+		t.Fatalf("expected the content-list message path, got %+v", items[0])
+	}
+	contents := msg.Content.OfInputItemContentList
+	if len(contents) != 2 || contents[0].OfInputText == nil || contents[1].OfInputImage == nil {
+		t.Fatalf("expected text plus image in order, got %+v", contents)
+	}
+	if msg.Phase != "final_answer" {
+		t.Errorf("Phase = %q, want final_answer kept through the degradation", msg.Phase)
+	}
+}
+
+// The reverse order: media first, then identity-bearing text. The media-only
+// prefix has no identity yet and must adopt the incoming one instead of
+// splitting off into a separate phase-less message.
+func TestConvertContentToInputItems_MediaBeforeIdentityText(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte("x")}},
+			{
+				Text:         "the chart above says it all",
+				PartMetadata: map[string]any{"message_id": "msg_1", "phase": "final_answer"},
+			},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d: %+v", len(items), items)
+	}
+	msg := items[0].OfMessage
+	if msg == nil {
+		t.Fatalf("expected the content-list message path, got %+v", items[0])
+	}
+	if msg.Phase != "final_answer" {
+		t.Errorf("Phase = %q, want final_answer adopted by the whole message", msg.Phase)
+	}
+	contents := msg.Content.OfInputItemContentList
+	if len(contents) != 2 || contents[0].OfInputImage == nil || contents[1].OfInputText == nil {
+		t.Fatalf("expected image then text, got %+v", contents)
+	}
+}
+
+// Phase metadata under a user role (multi-agent histories relabel other
+// agents' output) must not reach the wire: the API rejects phase on user
+// messages.
+func TestConvertContentToInputItems_UserRoleSuppressesPhase(t *testing.T) {
+	content := &genai.Content{
+		Role: "user",
+		Parts: []*genai.Part{
+			{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte("x")}},
+			{
+				Text:         "another agent said this",
+				PartMetadata: map[string]any{"message_id": "msg_1", "phase": "final_answer"},
+			},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	msg := items[0].OfMessage
+	if msg == nil {
+		t.Fatalf("expected the content-list message path, got %+v", items[0])
+	}
+	if msg.Phase != "" {
+		t.Errorf("Phase = %q, want empty on a user message", msg.Phase)
+	}
+	if msg.Role != "user" {
+		t.Errorf("Role = %q, want user", msg.Role)
+	}
+}

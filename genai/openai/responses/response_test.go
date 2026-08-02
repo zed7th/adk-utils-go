@@ -604,3 +604,64 @@ func TestConvertResponse_RefusalAndStatusMetadata(t *testing.T) {
 		t.Errorf("PartMetadata = %v, want refusal=true status=incomplete message_id=msg-1", pm)
 	}
 }
+
+// A failed response must surface the server's error instead of degrading
+// into "no output items" or, worse, passing partial output as a completed
+// turn.
+func TestConvertResponse_FailedStatus(t *testing.T) {
+	raw := []byte(`{
+		"id": "resp-9",
+		"status": "failed",
+		"error": {"code": "server_error", "message": "the backend fell over"},
+		"output": [{
+			"type": "message",
+			"id": "msg-1",
+			"role": "assistant",
+			"status": "incomplete",
+			"content": [{"type": "output_text", "text": "partial"}]
+		}],
+		"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+			"input_tokens_details": {"cached_tokens": 0},
+			"output_tokens_details": {"reasoning_tokens": 0}}
+	}`)
+
+	var resp responses.Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	_, err := convertResponse(&resp, "test-origin")
+	if err == nil {
+		t.Fatalf("expected an error for a failed response, got none")
+	}
+	if got := err.Error(); got != "openai responses api: the backend fell over" {
+		t.Errorf("err = %q, want the server message", got)
+	}
+}
+
+// A typed ResponseSchema with a non-object root must go non-strict: strict
+// mode requires an object root, and the typed schema allows primitives and
+// arrays.
+func TestBuildResponseParams_TypedSchemaNonObjectRoot(t *testing.T) {
+	m := New(Config{APIKey: "test", ModelName: "gpt-5.5"})
+
+	params, err := m.buildResponseParams(&model.LLMRequest{Config: &genai.GenerateContentConfig{
+		ResponseSchema: &genai.Schema{
+			Type:  genai.TypeArray,
+			Items: &genai.Schema{Type: genai.TypeString},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("buildResponseParams: %v", err)
+	}
+	format := params.Text.Format.OfJSONSchema
+	if format == nil {
+		t.Fatalf("expected a json_schema response format, got %+v", params.Text.Format)
+	}
+	if !format.Strict.Valid() || format.Strict.Value {
+		t.Errorf("Strict = %+v, want false for a non-object root", format.Strict)
+	}
+	if format.Schema["type"] != "array" {
+		t.Errorf("schema root = %v, want the array kept verbatim", format.Schema["type"])
+	}
+}

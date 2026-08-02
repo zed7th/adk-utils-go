@@ -164,6 +164,7 @@ func TestConvertFileDataToPart(t *testing.T) {
 		{"google doc becomes input_file", &genai.FileData{MIMEType: "application/vnd.google-apps.document", FileURI: "https://cdn.example.com/doc"}, "file"},
 		{"typescript becomes input_file", &genai.FileData{MIMEType: "application/typescript", FileURI: "https://cdn.example.com/app.ts"}, "file"},
 		{"yaml becomes input_file", &genai.FileData{MIMEType: "application/yaml", FileURI: "https://cdn.example.com/conf.yaml"}, "file"},
+		{"x-toml becomes input_file", &genai.FileData{MIMEType: "application/x-toml", FileURI: "https://cdn.example.com/conf.toml"}, "file"},
 		{"sql becomes input_file", &genai.FileData{MIMEType: "application/x-sql", FileURI: "https://cdn.example.com/schema.sql"}, "file"},
 		{"audio URL rejected", &genai.FileData{MIMEType: "audio/mpeg", FileURI: "https://cdn.example.com/talk.mp3"}, "error"},
 		{"unsupported", &genai.FileData{MIMEType: "video/mp4", FileURI: fileURI}, "error"},
@@ -228,5 +229,69 @@ func TestConvertTools_UnsupportedFacetsError(t *testing.T) {
 	_, err := convertTools([]*genai.Tool{{GoogleSearch: &genai.GoogleSearch{}}})
 	if err == nil {
 		t.Fatalf("expected an error for a GoogleSearch tool, got none")
+	}
+}
+
+// Base64 documents must carry a filename with an extension: the API
+// identifies the document type by it. DisplayName wins; a missing extension
+// is filled in from the MIME type, and types with no unambiguous extension
+// require the caller to name the file.
+func TestConvertInlineDataToPart_DocumentFilename(t *testing.T) {
+	cases := []struct {
+		name string
+		blob *genai.Blob
+		want string // expected filename, "" means an error is expected
+	}{
+		{"MIME-derived default", &genai.Blob{MIMEType: "application/pdf", Data: []byte("x")}, "input.pdf"},
+		{"DisplayName with extension kept", &genai.Blob{MIMEType: "text/csv", Data: []byte("x"), DisplayName: "report.csv"}, "report.csv"},
+		{"DisplayName without extension gains one", &genai.Blob{MIMEType: "application/pdf", Data: []byte("x"), DisplayName: "季度报告"}, "季度报告.pdf"},
+		{"python maps to py", &genai.Blob{MIMEType: "text/x-python", Data: []byte("x")}, "input.py"},
+		{"ambiguous iwork requires DisplayName", &genai.Blob{MIMEType: "application/vnd.apple.iwork", Data: []byte("x")}, ""},
+		{"ambiguous iwork with DisplayName passes", &genai.Blob{MIMEType: "application/vnd.apple.iwork", Data: []byte("x"), DisplayName: "deck.key"}, "deck.key"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := convertInlineDataToPart(c.blob)
+			if c.want == "" {
+				if err == nil {
+					t.Fatalf("expected an error, got %+v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if fn := got.OfInputFile.Filename.Value; fn != c.want {
+				t.Errorf("Filename = %q, want %q", fn, c.want)
+			}
+		})
+	}
+}
+
+// extensionForMIME maps explicit cases, falls back to the stripped subtype,
+// and returns empty for residues that are not usable extensions.
+func TestExtensionForMIME(t *testing.T) {
+	cases := map[string]string{
+		"text/plain": "txt",
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+		"application/x-sql":                    "sql",
+		"application/json":                     "json",
+		"text/csv":                             "csv",
+		"application/x-yaml":                   "yaml",
+		"message/rfc822":                       "eml",
+		"text/x-python":                        "py",
+		"text/x-typescript":                    "ts",
+		"application/x-rust":                   "rs",
+		"application/x-bash":                   "sh",
+		"text/x-c++":                           "cpp",
+		"text/x-golang":                        "go",
+		"application/vnd.apple.iwork":          "",
+		"application/vnd.google-apps.document": "",
+	}
+	for mime, want := range cases {
+		if got := extensionForMIME(mime); got != want {
+			t.Errorf("extensionForMIME(%q) = %q, want %q", mime, got, want)
+		}
 	}
 }

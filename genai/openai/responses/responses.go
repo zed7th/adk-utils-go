@@ -57,6 +57,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"sort"
 	"strings"
 
@@ -223,7 +224,7 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 				if event.Delta == "" {
 					continue
 				}
-				acc.text.WriteString(event.Delta)
+				acc.addText(event.ItemID, event.OutputIndex, event.Delta)
 				llmResp := &model.LLMResponse{
 					Content: &genai.Content{
 						Role:  genai.RoleModel,
@@ -240,7 +241,7 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 				if event.Delta == "" {
 					continue
 				}
-				acc.refusal.WriteString(event.Delta)
+				acc.addRefusal(event.ItemID, event.OutputIndex, event.Delta)
 				llmResp := &model.LLMResponse{
 					Content: &genai.Content{
 						Role:  genai.RoleModel,
@@ -292,7 +293,10 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 				// delta fallback cannot.
 				switch event.Item.Type {
 				case "message", "reasoning", "function_call":
-					acc.items = append(acc.items, event.Item)
+					acc.items = append(acc.items, doneItem{
+						index: event.OutputIndex,
+						item:  event.Item,
+					})
 				}
 
 			case "response.completed", "response.incomplete":
@@ -346,16 +350,60 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 
 // streamAccumulator collects streamed deltas so a complete final response
 // can be rebuilt when the terminal event lacks the aggregated output.
-// reasoning holds the reasoning summary; text holds the final answer;
-// refusal holds streamed refusal text; functionCalls holds tool calls
-// completed during the stream; items holds the complete output items from
-// output_item.done events.
+// reasoning holds the reasoning summary; texts and refusals hold delta text
+// per output item, so the fallback can tell which items the done events
+// covered; functionCalls holds tool calls completed during the stream;
+// items holds the complete output items from output_item.done events.
 type streamAccumulator struct {
 	reasoning     strings.Builder
-	text          strings.Builder
-	refusal       strings.Builder
+	texts         []*deltaBucket
+	refusals      []*deltaBucket
 	functionCalls []*genai.FunctionCall
-	items         []responses.ResponseOutputItemUnion
+	items         []doneItem
+}
+
+// deltaBucket accumulates streamed delta text for one output item; index is
+// the item's output_index, so uncovered buckets merge back in stream order.
+type deltaBucket struct {
+	itemID string
+	index  int64
+	text   strings.Builder
+}
+
+// doneItem pairs a complete output item with its output_index so the
+// fallback rebuilds the output array in order regardless of event arrival.
+type doneItem struct {
+	index int64
+	item  responses.ResponseOutputItemUnion
+}
+
+func appendDelta(buckets []*deltaBucket, itemID string, index int64, delta string) []*deltaBucket {
+	for _, b := range buckets {
+		if b.itemID == itemID {
+			b.text.WriteString(delta)
+			return buckets
+		}
+	}
+	b := &deltaBucket{itemID: itemID, index: index}
+	b.text.WriteString(delta)
+	return append(buckets, b)
+}
+
+func (a *streamAccumulator) addText(itemID string, index int64, delta string) {
+	a.texts = appendDelta(a.texts, itemID, index, delta)
+}
+
+func (a *streamAccumulator) addRefusal(itemID string, index int64, delta string) {
+	a.refusals = appendDelta(a.refusals, itemID, index, delta)
+}
+
+// joinDeltas concatenates bucket text in arrival order.
+func joinDeltas(buckets []*deltaBucket) string {
+	var sb strings.Builder
+	for _, b := range buckets {
+		sb.WriteString(b.text.String())
+	}
+	return sb.String()
 }
 
 // fallbackResponse rebuilds the final turn when the terminal event lacked
@@ -365,10 +413,18 @@ type streamAccumulator struct {
 // deltas alone are the last resort.
 func (a *streamAccumulator) fallbackResponse(resp *responses.Response, origin string) *model.LLMResponse {
 	if len(a.items) > 0 {
+		merged := append(append([]doneItem{}, a.items...), a.uncoveredBuckets()...)
+		sort.SliceStable(merged, func(i, j int) bool {
+			return merged[i].index < merged[j].index
+		})
+		output := make([]responses.ResponseOutputItemUnion, len(merged))
+		for i, di := range merged {
+			output[i] = di.item
+		}
 		shadow := *resp
-		shadow.Output = a.items
+		shadow.Output = output
 		if r, err := convertResponse(&shadow, origin); err == nil && !hasNoContent(r) {
-			a.fillMissingDeltas(r)
+			a.fillMissingReasoning(r)
 			return r
 		}
 	}
@@ -378,56 +434,84 @@ func (a *streamAccumulator) fallbackResponse(resp *responses.Response, origin st
 	)
 }
 
-// fillMissingDeltas merges delta-accumulated content the done items did not
-// cover: a gateway may complete only some items (e.g. reasoning) while the
-// rest of the turn streamed as bare deltas, and dropping either side would
-// lose output the consumer already saw.
-func (a *streamAccumulator) fillMissingDeltas(r *model.LLMResponse) {
-	hasThought, hasText := false, false
-	for _, p := range r.Content.Parts {
-		switch {
-		case p.Thought:
-			hasThought = true
-		case p.Text != "":
-			hasText = true
+// uncoveredBuckets turns delta buckets whose item never produced a done
+// event into synthetic message items: a gateway may complete only some
+// items while others streamed as bare deltas, and dropping either side
+// would lose output the consumer already saw. Sorting the result with the
+// done items by output_index restores the stream order. Buckets without an
+// item ID (a gateway that omits item_id) fall back to a coarse check
+// against any text the done message items carry.
+func (a *streamAccumulator) uncoveredBuckets() []doneItem {
+	doneMessageIDs := map[string]bool{}
+	doneHasText := false
+	for _, di := range a.items {
+		if di.item.Type != "message" {
+			continue
 		}
-	}
-	if !hasThought && a.reasoning.Len() > 0 {
-		r.Content.Parts = append(
-			[]*genai.Part{{Text: a.reasoning.String(), Thought: true}},
-			r.Content.Parts...,
-		)
-	}
-	if !hasText && (a.text.Len() > 0 || a.refusal.Len() > 0) {
-		// Text goes before any function calls, matching the temporal
-		// order in which the parts streamed.
-		idx := len(r.Content.Parts)
-		for i, p := range r.Content.Parts {
-			if p.FunctionCall != nil {
-				idx = i
-				break
+		if di.item.ID != "" {
+			doneMessageIDs[di.item.ID] = true
+		}
+		for _, cp := range di.item.Content {
+			if cp.Text != "" || cp.Refusal != "" {
+				doneHasText = true
 			}
 		}
-		var fill []*genai.Part
-		if a.text.Len() > 0 {
-			fill = append(fill, &genai.Part{Text: a.text.String()})
-		}
-		if a.refusal.Len() > 0 {
-			fill = append(fill, &genai.Part{
-				Text:         a.refusal.String(),
-				PartMetadata: map[string]any{"refusal": true},
-			})
-		}
-		parts := append([]*genai.Part{}, r.Content.Parts[:idx]...)
-		parts = append(parts, fill...)
-		r.Content.Parts = append(parts, r.Content.Parts[idx:]...)
 	}
+	covered := func(b *deltaBucket) bool {
+		if b.itemID == "" {
+			return doneHasText
+		}
+		return doneMessageIDs[b.itemID]
+	}
+
+	var synthetic []doneItem
+	for _, b := range a.texts {
+		if !covered(b) {
+			synthetic = append(synthetic, doneItem{index: b.index, item: responses.ResponseOutputItemUnion{
+				Type:    "message",
+				ID:      b.itemID,
+				Role:    "assistant",
+				Status:  "completed",
+				Content: []responses.ResponseOutputMessageContentUnion{{Type: "output_text", Text: b.text.String()}},
+			}})
+		}
+	}
+	for _, b := range a.refusals {
+		if !covered(b) {
+			synthetic = append(synthetic, doneItem{index: b.index, item: responses.ResponseOutputItemUnion{
+				Type:    "message",
+				ID:      b.itemID,
+				Role:    "assistant",
+				Status:  "completed",
+				Content: []responses.ResponseOutputMessageContentUnion{{Type: "refusal", Refusal: b.text.String()}},
+			}})
+		}
+	}
+	return synthetic
+}
+
+// fillMissingReasoning prepends the delta reasoning summary when the done
+// items did not include a reasoning item, so streamed thoughts are not
+// dropped from the persisted turn.
+func (a *streamAccumulator) fillMissingReasoning(r *model.LLMResponse) {
+	if a.reasoning.Len() == 0 {
+		return
+	}
+	for _, p := range r.Content.Parts {
+		if p.Thought {
+			return
+		}
+	}
+	r.Content.Parts = append(
+		[]*genai.Part{{Text: a.reasoning.String(), Thought: true}},
+		r.Content.Parts...,
+	)
 }
 
 // hasContent reports whether anything was accumulated that could be used to
 // rebuild a final response.
 func (a *streamAccumulator) hasContent() bool {
-	return a.reasoning.Len() > 0 || a.text.Len() > 0 || a.refusal.Len() > 0 ||
+	return a.reasoning.Len() > 0 || len(a.texts) > 0 || len(a.refusals) > 0 ||
 		len(a.functionCalls) > 0
 }
 
@@ -442,12 +526,12 @@ func (a *streamAccumulator) finalResponse(
 	if a.reasoning.Len() > 0 {
 		content.Parts = append(content.Parts, &genai.Part{Text: a.reasoning.String(), Thought: true})
 	}
-	if a.text.Len() > 0 {
-		content.Parts = append(content.Parts, &genai.Part{Text: a.text.String()})
+	if text := joinDeltas(a.texts); text != "" {
+		content.Parts = append(content.Parts, &genai.Part{Text: text})
 	}
-	if a.refusal.Len() > 0 {
+	if refusal := joinDeltas(a.refusals); refusal != "" {
 		content.Parts = append(content.Parts, &genai.Part{
-			Text:         a.refusal.String(),
+			Text:         refusal,
 			PartMetadata: map[string]any{"refusal": true},
 		})
 	}
@@ -555,14 +639,20 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 		if err != nil {
 			return fmt.Errorf("failed to convert response schema: %w", err)
 		}
-		normalizeStrictSchema(schemaMap)
+		// Strict mode requires an object root; a primitive or array root
+		// (which the typed schema allows) goes non-strict instead of
+		// building a request the API rejects.
+		strict := isObjectSchema(schemaMap)
+		if strict {
+			normalizeStrictSchema(schemaMap)
+		}
 		params.Text = responses.ResponseTextConfigParam{
 			Format: responses.ResponseFormatTextConfigUnionParam{
 				OfJSONSchema: &responses.ResponseFormatTextJSONSchemaConfigParam{
 					Name:        "response",
 					Description: param.NewOpt(cfg.ResponseSchema.Description),
 					Schema:      schemaMap,
-					Strict:      param.NewOpt(true),
+					Strict:      param.NewOpt(strict),
 				},
 			},
 		}
@@ -641,6 +731,10 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 	var textParts []string
 	var refusalFlags []bool
 	var mediaParts []responses.ResponseInputContentUnionParam
+	// orderedContents keeps text and media in their original interleaved
+	// order for mixed messages; regrouping them would change the prompt
+	// (e.g. which image a "describe the above" refers to).
+	var orderedContents responses.ResponseInputMessageContentListParam
 	var phase string
 	var messageID string
 	var msgStatus string
@@ -670,7 +764,12 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 		// manually, so the item identity survives the stateless round trip
 		// (models like gpt-5.3-codex expect phase back on every assistant
 		// message, and the API asks for output items to be replayed as-is).
-		if role == responses.EasyInputMessageRoleAssistant && (messageID != "" || phase != "") {
+		// Output message content can only carry text and refusals, so a
+		// message that also holds media (possible in histories written by
+		// other adapters) keeps the media and gives up the identity via the
+		// content-list path instead of silently dropping parts.
+		if role == responses.EasyInputMessageRoleAssistant && (messageID != "" || phase != "") &&
+			len(mediaParts) == 0 {
 			var contentParts []responses.ResponseOutputMessageContentUnionParam
 			for i, t := range textParts {
 				if refusalFlags[i] {
@@ -710,15 +809,20 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 				},
 			})
 		} else {
-			var contentList responses.ResponseInputMessageContentListParam
-			for _, t := range textParts {
-				contentList = append(contentList, responses.ResponseInputContentParamOfInputText(t))
+			// Only the message ID has no field on this path; the phase does
+			// (models like gpt-5.3-codex expect it back), so it is kept.
+			// Phase is assistant-only: multi-agent histories relabel other
+			// agents' output as user while keeping part metadata, and the
+			// API rejects phase on user messages.
+			msgPhase := responses.EasyInputMessagePhase("")
+			if role == responses.EasyInputMessageRoleAssistant {
+				msgPhase = responses.EasyInputMessagePhase(phase)
 			}
-			contentList = append(contentList, mediaParts...)
 			items = append(items, responses.ResponseInputItemUnionParam{
 				OfMessage: &responses.EasyInputMessageParam{
+					Phase: msgPhase,
 					Content: responses.EasyInputMessageContentUnionParam{
-						OfInputItemContentList: contentList,
+						OfInputItemContentList: orderedContents,
 					},
 					Role: role,
 					Type: responses.EasyInputMessageTypeMessage,
@@ -729,6 +833,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 		textParts = nil
 		refusalFlags = nil
 		mediaParts = nil
+		orderedContents = nil
 		phase = ""
 		messageID = ""
 		msgStatus = ""
@@ -807,9 +912,12 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 			// flushing on a message_id or phase change keeps each replayed
 			// message's identity and phase intact (models like
 			// gpt-5.3-codex expect commentary and final answer separate).
+			// Only buffered text marks a boundary: identity comes from text
+			// parts alone, so a media-only prefix has none yet and adopts
+			// the incoming identity instead of splitting off the media.
 			partID, _ := part.PartMetadata["message_id"].(string)
 			partPhase, _ := part.PartMetadata["phase"].(string)
-			if (len(textParts) > 0 || len(mediaParts) > 0) &&
+			if len(textParts) > 0 &&
 				(partID != messageID || partPhase != phase) {
 				flushMessage()
 			}
@@ -821,6 +929,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 			refusal, _ := part.PartMetadata["refusal"].(bool)
 			refusalFlags = append(refusalFlags, refusal)
 			textParts = append(textParts, part.Text)
+			orderedContents = append(orderedContents, responses.ResponseInputContentParamOfInputText(part.Text))
 
 		case part.InlineData != nil:
 			p, err := convertInlineDataToPart(part.InlineData)
@@ -828,6 +937,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 				return nil, err
 			}
 			mediaParts = append(mediaParts, *p)
+			orderedContents = append(orderedContents, *p)
 
 		case part.FileData != nil:
 			p, err := convertFileDataToPart(part.FileData)
@@ -835,6 +945,7 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 				return nil, err
 			}
 			mediaParts = append(mediaParts, *p)
+			orderedContents = append(orderedContents, *p)
 		}
 	}
 
@@ -847,6 +958,19 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 // alongside encrypted reasoning content so replay can be restricted to the
 // same channel.
 func convertResponse(resp *responses.Response, origin string) (*model.LLMResponse, error) {
+	// A failed response is an error, mirroring the streaming response.failed
+	// handling: without this check the server's message would degrade into
+	// "no output items", or partial output would pass as a completed turn.
+	if resp.Status == responses.ResponseStatusFailed {
+		msg := resp.Error.Message
+		if msg == "" {
+			msg = string(resp.Error.Code)
+		}
+		if msg == "" {
+			msg = "response generation failed"
+		}
+		return nil, fmt.Errorf("openai responses api: %s", msg)
+	}
 	if len(resp.Output) == 0 {
 		return nil, ErrNoOutputInResponse
 	}
@@ -1013,9 +1137,25 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 		}, nil
 
 	case isDocumentMIMEType(mediaType):
+		// Base64 file uploads need a filename with an extension: the API
+		// identifies the document type by it. The caller's DisplayName
+		// wins; a missing extension is filled in from the MIME type, and
+		// types without an unambiguous extension require a DisplayName.
+		filename := data.DisplayName
+		if path.Ext(filename) == "" {
+			ext := extensionForMIME(mediaType)
+			if ext == "" {
+				return nil, fmt.Errorf("no filename extension can be derived for MIME type %s: set DisplayName to a filename with an extension", mediaType)
+			}
+			if filename == "" {
+				filename = "input"
+			}
+			filename += "." + ext
+		}
 		return &responses.ResponseInputContentUnionParam{
 			OfInputFile: &responses.ResponseInputFileParam{
 				FileData: param.NewOpt(dataURI),
+				Filename: param.NewOpt(filename),
 			},
 		}, nil
 
@@ -1070,6 +1210,7 @@ func isDocumentMIMEType(mediaType string) bool {
 		"application/yaml",
 		"application/x-yaml",
 		"application/toml",
+		"application/x-toml",
 		"application/graphql",
 		"application/x-graphql",
 		"application/x-protobuf",
@@ -1134,6 +1275,87 @@ func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputConten
 	}
 }
 
+// extensionForMIME derives a filename extension for base64 file uploads.
+// Types whose subtype is not a usable extension are mapped explicitly; the
+// rest use the subtype with "x-" and "vnd." prefixes stripped. An empty
+// result marks a type with no unambiguous extension (e.g. iWork, which
+// covers both Pages and Keynote), where the caller must name the file.
+func extensionForMIME(mediaType string) string {
+	switch mediaType {
+	case "text/plain":
+		return "txt"
+	case "text/markdown":
+		return "md"
+	case "application/javascript", "text/javascript":
+		return "js"
+	case "application/typescript", "text/x-typescript":
+		return "ts"
+	case "text/x-python", "text/x-script.python":
+		return "py"
+	case "text/x-c":
+		return "c"
+	case "text/x-c++":
+		return "cpp"
+	case "text/x-csharp":
+		return "cs"
+	case "text/x-golang":
+		return "go"
+	case "text/x-ruby":
+		return "rb"
+	case "text/x-rust", "application/x-rust":
+		return "rs"
+	case "text/x-shellscript", "application/x-bash":
+		return "sh"
+	case "text/x-perl":
+		return "pl"
+	case "text/x-kotlin":
+		return "kt"
+	case "message/rfc822":
+		return "eml"
+	case "application/msword":
+		return "doc"
+	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+		return "docx"
+	case "application/vnd.ms-excel":
+		return "xls"
+	case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+		return "xlsx"
+	case "application/vnd.ms-powerpoint":
+		return "ppt"
+	case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+		return "pptx"
+	case "application/vnd.oasis.opendocument.text":
+		return "odt"
+	case "application/vnd.apple.pages":
+		return "pages"
+	case "application/vnd.apple.keynote":
+		return "key"
+	case "application/vnd.apple.iwork":
+		return ""
+	case "application/x-ndjson":
+		return "ndjson"
+	case "application/x-subrip":
+		return "srt"
+	case "application/x-httpd-php", "application/x-httpd-php-source":
+		return "php"
+	case "application/x-protobuf":
+		return "proto"
+	case "application/x-terraform":
+		return "tf"
+	case "application/x-powershell":
+		return "ps1"
+	case "application/graphql", "application/x-graphql":
+		return "graphql"
+	}
+	sub := mediaType[strings.LastIndexByte(mediaType, '/')+1:]
+	sub = strings.TrimPrefix(sub, "x-")
+	sub = strings.TrimPrefix(sub, "vnd.")
+	if strings.ContainsAny(sub, "./+") {
+		return ""
+	}
+	return sub
+}
+
 // normalizeMIMEType strips parameters from a MIME string ("image/png;
 // charset=utf-8" becomes "image/png") so the converters match on the media
 // type alone. Malformed strings come back unchanged and fail the match with
@@ -1160,10 +1382,12 @@ func convertUsageMetadata(usage responses.ResponseUsage) *genai.GenerateContentR
 	}
 }
 
-// convertRole maps genai roles to Responses API EasyInputMessageRole.
+// convertRole maps genai roles to Responses API EasyInputMessageRole. The
+// literal "assistant" appears in histories written by other adapters and
+// must not degrade to a user message.
 func convertRole(role string) responses.EasyInputMessageRole {
 	switch role {
-	case "model":
+	case "model", "assistant":
 		return responses.EasyInputMessageRoleAssistant
 	case "system":
 		return responses.EasyInputMessageRoleSystem
@@ -1245,11 +1469,61 @@ func convertFunctionParams(params any) (map[string]any, bool) {
 		return nil, false
 	}
 	lowercaseTypes(m)
+	m = inlineRootRef(m)
+	// Strict mode requires the root to be a plain object: a root that is
+	// still a $ref, an array, or a union goes non-strict as-is. anyOf and
+	// oneOf are both checked because normalization would rename a root
+	// oneOf into the anyOf the API rejects at the root.
+	if !isObjectSchema(m) {
+		return m, false
+	}
+	for _, key := range []string{"anyOf", "oneOf"} {
+		if _, ok := m[key]; ok {
+			return m, false
+		}
+	}
 	if !fitsStrictSubset(m) {
 		return m, false
 	}
 	normalizeStrictSchema(m)
 	return m, true
+}
+
+// inlineRootRef resolves the root-level "$ref plus $defs" shape that Go
+// schema generators commonly emit. Strict mode wants the root to be a plain
+// object, so the referenced definition's keys are copied onto the root and
+// $defs stays for the remaining references. Roots with extra siblings or an
+// unresolvable pointer come back unchanged and fail the object check.
+func inlineRootRef(m map[string]any) map[string]any {
+	ref, ok := m["$ref"].(string)
+	if !ok {
+		return m
+	}
+	for key := range m {
+		if key != "$ref" && key != "$defs" {
+			return m
+		}
+	}
+	name, found := strings.CutPrefix(ref, "#/$defs/")
+	if !found || strings.Contains(name, "/") {
+		return m
+	}
+	defs, _ := m["$defs"].(map[string]any)
+	target, ok := defs[name].(map[string]any)
+	if !ok {
+		return m
+	}
+	if _, hasOwnDefs := target["$defs"]; hasOwnDefs {
+		return m
+	}
+	// The target is copied so the root and the $defs entry do not share
+	// maps during normalization.
+	root := deepCopySchema(target)
+	if root == nil {
+		return m
+	}
+	root["$defs"] = defs
+	return root
 }
 
 // unsupportedStrictKeywords are schema keywords the strict subset rejects and
@@ -1277,6 +1551,17 @@ func fitsStrictSubset(schema map[string]any) bool {
 
 	if ap, ok := schema["additionalProperties"]; ok && ap != false {
 		return false
+	}
+
+	// A $ref next to anyOf or oneOf is a conjunction the strict subset
+	// cannot express: hoisting the reference into the union would change
+	// what the schema accepts, so such nodes go non-strict.
+	if _, ok := schema["$ref"]; ok {
+		for _, key := range []string{"anyOf", "oneOf"} {
+			if _, exists := schema[key]; exists {
+				return false
+			}
+		}
 	}
 
 	if isArraySchema(schema) {
@@ -1430,6 +1715,18 @@ func normalizeStrictSchema(schema map[string]any) {
 		}
 		delete(schema, "oneOf")
 	}
+
+	// The strict validator rejects a $ref with sibling keys, so the
+	// reference moves into a single-branch anyOf while the siblings stay
+	// on the node: annotations and constraints keep applying alongside
+	// the reference instead of being dropped.
+	if ref, ok := schema["$ref"]; ok && len(schema) > 1 {
+		if _, exists := schema["anyOf"]; !exists {
+			delete(schema, "$ref")
+			schema["anyOf"] = []any{map[string]any{"$ref": ref}}
+		}
+	}
+
 	if branches, ok := schema["anyOf"].([]any); ok {
 		for _, branch := range branches {
 			if branchMap, ok := branch.(map[string]any); ok {
@@ -1722,7 +2019,9 @@ func joinTexts(texts []string) string {
 
 // parseJSONArgs parses a function-call arguments string into a map. Malformed
 // JSON is an error, not an empty map: a tool with side effects must not run
-// with silently emptied arguments.
+// with silently emptied arguments. A literal "null" is well-formed JSON some
+// gateways emit for parameterless calls; like the empty string it means no
+// arguments.
 func parseJSONArgs(argsJSON string) (map[string]any, error) {
 	if argsJSON == "" {
 		return make(map[string]any), nil
@@ -1730,6 +2029,9 @@ func parseJSONArgs(argsJSON string) (map[string]any, error) {
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return nil, fmt.Errorf("malformed function call arguments %q: %w", argsJSON, err)
+	}
+	if args == nil {
+		return make(map[string]any), nil
 	}
 	return args, nil
 }

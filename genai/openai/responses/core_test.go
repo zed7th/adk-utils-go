@@ -511,3 +511,212 @@ func TestNormalizeStrictSchema_NullableConvertsToNullUnion(t *testing.T) {
 		t.Errorf("tag type = %v, want string (nullable false adds nothing)", tag["type"])
 	}
 }
+
+// The strict validator rejects a $ref with sibling keys. The reference
+// hoists into a single-branch anyOf with the siblings kept on the node; a
+// bare $ref stays untouched; combining $ref with a union goes non-strict
+// because the conjunction cannot be expressed faithfully.
+func TestNormalizeStrictSchema_RefWithSiblings(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"target": map[string]any{"$ref": "#/$defs/target", "description": "what to hit"},
+			"backup": map[string]any{"$ref": "#/$defs/target"},
+		},
+		"required": []any{"target", "backup"},
+		"$defs": map[string]any{
+			"target": map[string]any{"type": "string"},
+		},
+	}
+
+	normalizeStrictSchema(schema)
+
+	props := schema["properties"].(map[string]any)
+	target := props["target"].(map[string]any)
+	if _, ok := target["$ref"]; ok {
+		t.Errorf("$ref with siblings survived at top level: %+v", target)
+	}
+	if target["description"] != "what to hit" {
+		t.Errorf("description lost: %+v", target)
+	}
+	branches, _ := target["anyOf"].([]any)
+	if len(branches) != 1 || branches[0].(map[string]any)["$ref"] != "#/$defs/target" {
+		t.Errorf("anyOf = %+v, want a single $ref branch", target["anyOf"])
+	}
+	backup := props["backup"].(map[string]any)
+	if backup["$ref"] != "#/$defs/target" || len(backup) != 1 {
+		t.Errorf("bare $ref should stay untouched, got %+v", backup)
+	}
+}
+
+// An optional $ref property with siblings must end up nullable and keep its
+// annotations: the hoisted anyOf gains a null branch.
+func TestNormalizeStrictSchema_OptionalRefWithSiblings(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"target": map[string]any{"$ref": "#/$defs/target", "description": "what to hit"},
+		},
+		"$defs": map[string]any{
+			"target": map[string]any{"type": "string"},
+		},
+	}
+
+	normalizeStrictSchema(schema)
+
+	target := schema["properties"].(map[string]any)["target"].(map[string]any)
+	if target["description"] != "what to hit" {
+		t.Errorf("description lost: %+v", target)
+	}
+	branches, _ := target["anyOf"].([]any)
+	if len(branches) != 2 {
+		t.Fatalf("anyOf = %+v, want $ref branch plus null branch", target["anyOf"])
+	}
+	if branches[0].(map[string]any)["$ref"] != "#/$defs/target" {
+		t.Errorf("first branch = %+v, want the $ref", branches[0])
+	}
+	if branches[1].(map[string]any)["type"] != "null" {
+		t.Errorf("second branch = %+v, want null", branches[1])
+	}
+}
+
+// $ref combined with a union is a conjunction the strict subset cannot
+// express, so the whole tool goes non-strict instead of being rewritten.
+func TestConvertFunctionParams_RefWithUnionGoesNonStrict(t *testing.T) {
+	params := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"target": map[string]any{
+				"$ref":  "#/$defs/a",
+				"anyOf": []any{map[string]any{"type": "string"}},
+			},
+		},
+		"$defs": map[string]any{
+			"a": map[string]any{"type": "string"},
+		},
+	}
+
+	schemaMap, strict := convertFunctionParams(params)
+	if schemaMap == nil {
+		t.Fatalf("conversion failed")
+	}
+	if strict {
+		t.Errorf("strict = true, want false for a $ref+union conjunction")
+	}
+}
+
+// Go schema generators commonly emit a root-level $ref pointing into $defs.
+// Strict mode wants a plain object root, so the reference inlines; shapes
+// that cannot inline faithfully go non-strict instead of reaching the API
+// as a root anyOf or a root $ref, which strict mode rejects.
+func TestConvertFunctionParams_RootRef(t *testing.T) {
+	t.Run("root ref with defs inlines and stays strict", func(t *testing.T) {
+		params := map[string]any{
+			"$ref": "#/$defs/args",
+			"$defs": map[string]any{
+				"args": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"query": map[string]any{"type": "string"},
+						"child": map[string]any{"$ref": "#/$defs/args"},
+					},
+					"required": []any{"query"},
+				},
+			},
+		}
+
+		schemaMap, strict := convertFunctionParams(params)
+		if !strict {
+			t.Fatalf("strict = false, want true for an inlinable root ref")
+		}
+		if _, ok := schemaMap["$ref"]; ok {
+			t.Errorf("root $ref survived: %+v", schemaMap)
+		}
+		if _, ok := schemaMap["anyOf"]; ok {
+			t.Errorf("root anyOf is rejected by strict mode: %+v", schemaMap)
+		}
+		if schemaMap["type"] != "object" {
+			t.Errorf("root type = %v, want object", schemaMap["type"])
+		}
+		if _, ok := schemaMap["$defs"].(map[string]any); !ok {
+			t.Errorf("$defs lost from the root: %+v", schemaMap)
+		}
+		props, _ := schemaMap["properties"].(map[string]any)
+		if _, ok := props["query"]; !ok {
+			t.Errorf("inlined properties missing: %+v", schemaMap)
+		}
+	})
+
+	t.Run("root ref with extra siblings goes non-strict", func(t *testing.T) {
+		params := map[string]any{
+			"$ref":        "#/$defs/args",
+			"description": "tool arguments",
+			"$defs": map[string]any{
+				"args": map[string]any{"type": "object"},
+			},
+		}
+		if _, strict := convertFunctionParams(params); strict {
+			t.Errorf("strict = true, want false for a root ref with extra siblings")
+		}
+	})
+
+	t.Run("unresolvable root ref goes non-strict", func(t *testing.T) {
+		params := map[string]any{
+			"$ref":  "#/definitions/args",
+			"$defs": map[string]any{"args": map[string]any{"type": "object"}},
+		}
+		if _, strict := convertFunctionParams(params); strict {
+			t.Errorf("strict = true, want false for an unresolvable root ref")
+		}
+	})
+
+	t.Run("non-object root goes non-strict", func(t *testing.T) {
+		params := map[string]any{
+			"type":  "array",
+			"items": map[string]any{"type": "string"},
+		}
+		if _, strict := convertFunctionParams(params); strict {
+			t.Errorf("strict = true, want false for a non-object root")
+		}
+	})
+}
+
+// The API rejects anyOf at the root of a strict schema, and a root oneOf
+// would be renamed into exactly that during normalization. Both go
+// non-strict, whether written directly or reached by inlining a root $ref.
+func TestConvertFunctionParams_RootUnionGoesNonStrict(t *testing.T) {
+	t.Run("direct root anyOf", func(t *testing.T) {
+		params := map[string]any{
+			"type": "object",
+			"anyOf": []any{
+				map[string]any{"required": []any{"a"}},
+			},
+			"properties": map[string]any{"a": map[string]any{"type": "string"}},
+		}
+		m, strict := convertFunctionParams(params)
+		if strict {
+			t.Errorf("strict = true, want false for a root anyOf")
+		}
+		if m["anyOf"] == nil {
+			t.Errorf("non-strict schema should pass through unchanged: %+v", m)
+		}
+	})
+
+	t.Run("root oneOf reached through an inlined ref", func(t *testing.T) {
+		params := map[string]any{
+			"$ref": "#/$defs/args",
+			"$defs": map[string]any{
+				"args": map[string]any{
+					"type": "object",
+					"oneOf": []any{
+						map[string]any{"properties": map[string]any{"a": map[string]any{"type": "string"}}},
+					},
+					"properties": map[string]any{"a": map[string]any{"type": "string"}},
+				},
+			},
+		}
+		if _, strict := convertFunctionParams(params); strict {
+			t.Errorf("strict = true, want false for an inlined root oneOf")
+		}
+	})
+}
