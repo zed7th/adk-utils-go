@@ -574,10 +574,14 @@ func (m *Model) buildResponseParams(req *model.LLMRequest) (responses.ResponseNe
 		}
 	}
 
-	// The conversation history maps to input items.
+	// The conversation history maps to input items. Unpaired calls and
+	// outputs are dropped on the way: ADK histories can end mid-tool-call
+	// (cancel, compaction, agent switch), and the API rejects a
+	// function_call whose output never arrived, and the reverse.
+	dangling := danglingCallIDs(req.Contents)
 	var input responses.ResponseInputParam
 	for _, content := range req.Contents {
-		items, err := convertContentToInputItems(content, m.origin)
+		items, err := convertContentToInputItems(content, m.origin, dangling)
 		if err != nil {
 			return responses.ResponseNewParams{}, err
 		}
@@ -721,12 +725,46 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 	return nil
 }
 
+// danglingCallIDs collects the IDs of function calls without a matching
+// output and outputs without a matching call across the whole history, so
+// the conversion can drop them: the API rejects both shapes.
+func danglingCallIDs(contents []*genai.Content) map[string]bool {
+	calls := map[string]bool{}
+	outputs := map[string]bool{}
+	for _, content := range contents {
+		if content == nil {
+			continue
+		}
+		for _, part := range content.Parts {
+			switch {
+			case part.FunctionCall != nil:
+				calls[part.FunctionCall.ID] = true
+			case part.FunctionResponse != nil:
+				outputs[part.FunctionResponse.ID] = true
+			}
+		}
+	}
+	dangling := map[string]bool{}
+	for id := range calls {
+		if !outputs[id] {
+			dangling[id] = true
+		}
+	}
+	for id := range outputs {
+		if !calls[id] {
+			dangling[id] = true
+		}
+	}
+	return dangling
+}
+
 // convertContentToInputItems converts a genai.Content into Responses API input items.
 // A single Content may produce multiple items: text/media coalesce into a message,
 // while FunctionCall and FunctionResponse become separate typed items. origin
 // identifies the requesting channel: encrypted reasoning is only replayed when
-// it was captured from the same origin.
-func convertContentToInputItems(content *genai.Content, origin string) ([]responses.ResponseInputItemUnionParam, error) {
+// it was captured from the same origin. Parts whose call ID is in dangling
+// are skipped.
+func convertContentToInputItems(content *genai.Content, origin string, dangling map[string]bool) ([]responses.ResponseInputItemUnionParam, error) {
 	var items []responses.ResponseInputItemUnionParam
 	var textParts []string
 	var refusalFlags []bool
@@ -747,6 +785,12 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 	lastFollower := -1
 	for i, part := range content.Parts {
 		if part.Thought {
+			continue
+		}
+		if part.FunctionCall != nil && dangling[part.FunctionCall.ID] {
+			continue
+		}
+		if part.FunctionResponse != nil && dangling[part.FunctionResponse.ID] {
 			continue
 		}
 		if part.FunctionCall != nil || part.FunctionResponse != nil ||
@@ -842,6 +886,9 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 	for i, part := range content.Parts {
 		switch {
 		case part.FunctionResponse != nil:
+			if dangling[part.FunctionResponse.ID] {
+				continue
+			}
 			flushMessage()
 			responseJSON, err := common.MarshalToolPayload(part.FunctionResponse.Response)
 			if err != nil {
@@ -852,6 +899,9 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 			))
 
 		case part.FunctionCall != nil:
+			if dangling[part.FunctionCall.ID] {
+				continue
+			}
 			flushMessage()
 			argsJSON, err := common.MarshalToolPayload(part.FunctionCall.Args)
 			if err != nil {

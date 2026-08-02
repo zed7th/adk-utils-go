@@ -150,7 +150,7 @@ func TestConvertContentToInputItems(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := convertContentToInputItems(c.content, "test-origin")
+			got, err := convertContentToInputItems(c.content, "test-origin", nil)
 			if err != nil {
 				t.Fatalf("convertContentToInputItems error: %v", err)
 			}
@@ -178,7 +178,7 @@ func TestConvertContentToInputItems_PhasePreserved(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestConvertContentToInputItems_ThoughtPartsWithoutEncryptedContentSkipped(t
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestConvertContentToInputItems_ThoughtPartsWithEncryptedContentReplayed(t *
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestConvertContentToInputItems_EncryptedThoughtWithoutSummary(t *testing.T)
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestConvertContentToInputItems_EncryptedThoughtFromOtherOriginSkipped(t *te
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "openai-origin")
+	items, err := convertContentToInputItems(content, "openai-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestConvertContentToInputItems_EncryptedThoughtWithoutOriginSkipped(t *test
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestConvertContentToInputItems_ThoughtInUserTurnSkipped(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestConvertContentToInputItems_TrailingThoughtSkipped(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -428,7 +428,7 @@ func TestConvertContentToInputItems_NoPhaseFallback(t *testing.T) {
 		Parts: []*genai.Part{{Text: "plain response"}},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -452,7 +452,7 @@ func TestConvertContentToInputItems_NilToolPayloadsBecomeEmptyObject(t *testing.
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -486,7 +486,7 @@ func TestConvertContentToInputItems_MessageBoundariesPreserved(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -522,7 +522,7 @@ func TestConvertContentToInputItems_SameMessagePartsCoalesce(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -551,7 +551,7 @@ func TestConvertContentToInputItems_MessageIDWithoutPhase(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -587,7 +587,7 @@ func TestConvertContentToInputItems_RefusalAndStatusReplayed(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -622,7 +622,7 @@ func TestConvertContentToInputItems_InterleavedOrderPreserved(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -658,7 +658,7 @@ func TestConvertContentToInputItems_IdentityWithMediaKeepsMedia(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -693,7 +693,7 @@ func TestConvertContentToInputItems_MediaBeforeIdentityText(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -728,7 +728,7 @@ func TestConvertContentToInputItems_UserRoleSuppressesPhase(t *testing.T) {
 		},
 	}
 
-	items, err := convertContentToInputItems(content, "test-origin")
+	items, err := convertContentToInputItems(content, "test-origin", nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -744,5 +744,34 @@ func TestConvertContentToInputItems_UserRoleSuppressesPhase(t *testing.T) {
 	}
 	if msg.Role != "user" {
 		t.Errorf("Role = %q, want user", msg.Role)
+	}
+}
+
+// A dropped dangling call no longer counts as a follower: the reasoning
+// item that led to it must be skipped too, or the API rejects it as
+// dangling in turn.
+func TestConvertContentToInputItems_DanglingCallExcludedFromFollowers(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text:    "planning",
+				Thought: true,
+				PartMetadata: map[string]any{
+					"reasoning_id":      "rs_1",
+					"encrypted_content": "enc-blob",
+					"reasoning_origin":  "test-origin",
+				},
+			},
+			{FunctionCall: &genai.FunctionCall{ID: "call_cancelled", Name: "slow_tool"}},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin", map[string]bool{"call_cancelled": true})
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items (call dropped, reasoning left without a follower), got %d: %+v", len(items), items)
 	}
 }

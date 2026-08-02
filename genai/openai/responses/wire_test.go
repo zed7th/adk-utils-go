@@ -662,3 +662,65 @@ func TestWireBody_StreamFailureEvents(t *testing.T) {
 		})
 	}
 }
+
+// A history that ends mid-tool-call (the user cancelled the run) must not
+// replay the unpaired function_call: the API rejects a call whose output
+// never arrived. The reasoning item that led to the dropped call has no
+// follower left and must go too.
+func TestWireBody_DanglingCallDropped(t *testing.T) {
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "do the thing"}}},
+			{Role: "model", Parts: []*genai.Part{
+				{
+					Text:    "planning",
+					Thought: true,
+					PartMetadata: map[string]any{
+						"reasoning_id":      "rs_1",
+						"encrypted_content": "enc-blob",
+						"reasoning_origin":  "wrong-origin",
+					},
+				},
+				{FunctionCall: &genai.FunctionCall{ID: "call_cancelled", Name: "slow_tool"}},
+			}},
+			{Role: "user", Parts: []*genai.Part{{Text: "never mind, tell me a joke"}}},
+		},
+	}
+
+	body := captureBody(t, req)
+
+	input, _ := body["input"].([]any)
+	if len(input) != 2 {
+		t.Fatalf("input items = %d, want 2 (both user messages only): %v", len(input), input)
+	}
+	for i, raw := range input {
+		item, _ := raw.(map[string]any)
+		if item["type"] == "function_call" || item["type"] == "reasoning" {
+			t.Errorf("input[%d] = %v, want the dangling call and its reasoning dropped", i, item)
+		}
+	}
+}
+
+// The reverse orphan: an output whose call was lost to compaction must be
+// dropped too.
+func TestWireBody_OrphanOutputDropped(t *testing.T) {
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{
+				{FunctionResponse: &genai.FunctionResponse{ID: "call_lost", Name: "slow_tool"}},
+				{Text: "carry on"},
+			}},
+		},
+	}
+
+	body := captureBody(t, req)
+
+	input, _ := body["input"].([]any)
+	if len(input) != 1 {
+		t.Fatalf("input items = %d, want 1 (the text only): %v", len(input), input)
+	}
+	item, _ := input[0].(map[string]any)
+	if item["type"] == "function_call_output" {
+		t.Errorf("input[0] = %v, want the orphan output dropped", item)
+	}
+}
