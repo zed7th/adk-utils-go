@@ -573,3 +573,92 @@ func TestWireBody_InlineDocumentCarriesFilename(t *testing.T) {
 		t.Errorf("file_data missing from the wire body")
 	}
 }
+
+// Reasoning that streamed only as summary deltas must be prepended when the
+// done items carry no reasoning item of their own.
+func TestWireBody_StreamFallbackPrependsDeltaReasoning(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: response.reasoning_summary_text.delta\n")
+		io.WriteString(w, `data: {"type":"response.reasoning_summary_text.delta","delta":"thinking...","sequence_number":1}`+"\n\n")
+		io.WriteString(w, "event: response.output_item.done\n")
+		io.WriteString(w, `data: {"type":"response.output_item.done","sequence_number":2,"output_index":1,"item":{"type":"message","id":"msg_1","role":"assistant","status":"completed","phase":"final_answer","content":[{"type":"output_text","text":"done"}]}}`+"\n\n")
+		io.WriteString(w, "event: response.completed\n")
+		io.WriteString(w, `data: {"type":"response.completed","sequence_number":3,"response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	m := New(Config{BaseURL: srv.URL, APIKey: "test-key", ModelName: "gpt-test"})
+
+	var final *model.LLMResponse
+	req := &model.LLMRequest{Contents: []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+	}}
+	for resp, err := range m.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			t.Fatalf("GenerateContent: %v", err)
+		}
+		if !resp.Partial {
+			final = resp
+		}
+	}
+	if final == nil {
+		t.Fatalf("no final response was yielded")
+	}
+	if len(final.Content.Parts) != 2 {
+		t.Fatalf("expected 2 parts (thought + message), got %d: %+v", len(final.Content.Parts), final.Content.Parts)
+	}
+	if p := final.Content.Parts[0]; !p.Thought || p.Text != "thinking..." {
+		t.Errorf("first part = %+v, want the prepended delta reasoning", p)
+	}
+	if p := final.Content.Parts[1]; p.Text != "done" {
+		t.Errorf("second part = %+v, want the done message", p)
+	}
+}
+
+// response.failed and bare error events must surface as errors, not as an
+// empty or truncated turn.
+func TestWireBody_StreamFailureEvents(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+	}{
+		{
+			"response.failed",
+			"event: response.failed\n" +
+				`data: {"type":"response.failed","sequence_number":1,"response":{"id":"resp_1","status":"failed","error":{"code":"server_error","message":"backend exploded"},"output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}` + "\n\n",
+		},
+		{
+			"error event",
+			"event: error\n" +
+				`data: {"type":"error","sequence_number":1,"code":"rate_limited","message":"slow down"}` + "\n\n",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, c.payload)
+			}))
+			defer srv.Close()
+
+			m := New(Config{BaseURL: srv.URL, APIKey: "test-key", ModelName: "gpt-test"})
+
+			req := &model.LLMRequest{Contents: []*genai.Content{
+				{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+			}}
+			var gotErr error
+			for _, err := range m.GenerateContent(context.Background(), req, true) {
+				if err != nil {
+					gotErr = err
+				}
+			}
+			if gotErr == nil {
+				t.Fatalf("expected an error, got none")
+			}
+		})
+	}
+}

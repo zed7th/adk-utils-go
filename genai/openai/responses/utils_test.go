@@ -26,6 +26,7 @@ func TestConvertRole(t *testing.T) {
 	}{
 		{"user", responses.EasyInputMessageRoleUser},
 		{"model", responses.EasyInputMessageRoleAssistant},
+		{"assistant", responses.EasyInputMessageRoleAssistant},
 		{"system", responses.EasyInputMessageRoleSystem},
 		{"unknown", responses.EasyInputMessageRoleUser},
 	}

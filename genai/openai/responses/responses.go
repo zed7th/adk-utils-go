@@ -763,7 +763,12 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 		// manually, so the item identity survives the stateless round trip
 		// (models like gpt-5.3-codex expect phase back on every assistant
 		// message, and the API asks for output items to be replayed as-is).
-		if role == responses.EasyInputMessageRoleAssistant && (messageID != "" || phase != "") {
+		// Output message content can only carry text and refusals, so a
+		// message that also holds media (possible in histories written by
+		// other adapters) keeps the media and gives up the identity via the
+		// content-list path instead of silently dropping parts.
+		if role == responses.EasyInputMessageRoleAssistant && (messageID != "" || phase != "") &&
+			len(mediaParts) == 0 {
 			var contentParts []responses.ResponseOutputMessageContentUnionParam
 			for i, t := range textParts {
 				if refusalFlags[i] {
@@ -1328,10 +1333,12 @@ func convertUsageMetadata(usage responses.ResponseUsage) *genai.GenerateContentR
 	}
 }
 
-// convertRole maps genai roles to Responses API EasyInputMessageRole.
+// convertRole maps genai roles to Responses API EasyInputMessageRole. The
+// literal "assistant" appears in histories written by other adapters and
+// must not degrade to a user message.
 func convertRole(role string) responses.EasyInputMessageRole {
 	switch role {
-	case "model":
+	case "model", "assistant":
 		return responses.EasyInputMessageRoleAssistant
 	case "system":
 		return responses.EasyInputMessageRoleSystem

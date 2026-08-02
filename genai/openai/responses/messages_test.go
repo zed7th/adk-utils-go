@@ -642,3 +642,35 @@ func TestConvertContentToInputItems_InterleavedOrderPreserved(t *testing.T) {
 		}
 	}
 }
+
+// An identity-bearing assistant message that also holds media keeps the
+// media through the content-list path: output message content cannot carry
+// media, and dropping parts silently would change the prompt.
+func TestConvertContentToInputItems_IdentityWithMediaKeepsMedia(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{
+				Text:         "here is the image",
+				PartMetadata: map[string]any{"message_id": "msg_1", "phase": "final_answer"},
+			},
+			{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte("x")}},
+		},
+	}
+
+	items, err := convertContentToInputItems(content, "test-origin")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	msg := items[0].OfMessage
+	if msg == nil {
+		t.Fatalf("expected the content-list message path, got %+v", items[0])
+	}
+	contents := msg.Content.OfInputItemContentList
+	if len(contents) != 2 || contents[0].OfInputText == nil || contents[1].OfInputImage == nil {
+		t.Fatalf("expected text plus image in order, got %+v", contents)
+	}
+}
