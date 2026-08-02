@@ -57,6 +57,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"sort"
 	"strings"
 
@@ -808,8 +809,11 @@ func convertContentToInputItems(content *genai.Content, origin string) ([]respon
 				},
 			})
 		} else {
+			// Only the message ID has no field on this path; the phase does
+			// (models like gpt-5.3-codex expect it back), so it is kept.
 			items = append(items, responses.ResponseInputItemUnionParam{
 				OfMessage: &responses.EasyInputMessageParam{
+					Phase: responses.EasyInputMessagePhase(phase),
 					Content: responses.EasyInputMessageContentUnionParam{
 						OfInputItemContentList: orderedContents,
 					},
@@ -1123,12 +1127,20 @@ func convertInlineDataToPart(data *genai.Blob) (*responses.ResponseInputContentU
 		}, nil
 
 	case isDocumentMIMEType(mediaType):
-		// Base64 file uploads need a filename: the API identifies the
-		// document type by its extension. The caller's DisplayName wins,
-		// with a stable MIME-derived fallback.
+		// Base64 file uploads need a filename with an extension: the API
+		// identifies the document type by it. The caller's DisplayName
+		// wins; a missing extension is filled in from the MIME type, and
+		// types without an unambiguous extension require a DisplayName.
 		filename := data.DisplayName
-		if filename == "" {
-			filename = filenameForMIME(mediaType)
+		if path.Ext(filename) == "" {
+			ext := extensionForMIME(mediaType)
+			if ext == "" {
+				return nil, fmt.Errorf("no filename extension can be derived for MIME type %s: set DisplayName to a filename with an extension", mediaType)
+			}
+			if filename == "" {
+				filename = "input"
+			}
+			filename += "." + ext
 		}
 		return &responses.ResponseInputContentUnionParam{
 			OfInputFile: &responses.ResponseInputFileParam{
@@ -1253,58 +1265,85 @@ func convertFileDataToPart(data *genai.FileData) (*responses.ResponseInputConten
 	}
 }
 
-// filenameForMIME derives a stable filename for base64 file uploads. Types
-// whose subtype is not a usable extension are mapped explicitly; the rest
-// use the subtype with "x-" and "vnd." prefixes stripped.
-func filenameForMIME(mediaType string) string {
+// extensionForMIME derives a filename extension for base64 file uploads.
+// Types whose subtype is not a usable extension are mapped explicitly; the
+// rest use the subtype with "x-" and "vnd." prefixes stripped. An empty
+// result marks a type with no unambiguous extension (e.g. iWork, which
+// covers both Pages and Keynote), where the caller must name the file.
+func extensionForMIME(mediaType string) string {
 	switch mediaType {
 	case "text/plain":
-		return "input.txt"
+		return "txt"
 	case "text/markdown":
-		return "input.md"
+		return "md"
 	case "application/javascript", "text/javascript":
-		return "input.js"
+		return "js"
 	case "application/typescript":
-		return "input.ts"
+		return "ts"
+	case "text/x-python", "text/x-script.python":
+		return "py"
+	case "text/x-c":
+		return "c"
+	case "text/x-c++":
+		return "cpp"
+	case "text/x-csharp":
+		return "cs"
+	case "text/x-golang":
+		return "go"
+	case "text/x-ruby":
+		return "rb"
+	case "text/x-rust":
+		return "rs"
+	case "text/x-shellscript":
+		return "sh"
+	case "text/x-perl":
+		return "pl"
+	case "text/x-kotlin":
+		return "kt"
 	case "message/rfc822":
-		return "input.eml"
+		return "eml"
 	case "application/msword":
-		return "input.doc"
+		return "doc"
 	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-		return "input.docx"
+		return "docx"
 	case "application/vnd.ms-excel":
-		return "input.xls"
+		return "xls"
 	case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
-		return "input.xlsx"
+		return "xlsx"
 	case "application/vnd.ms-powerpoint":
-		return "input.ppt"
+		return "ppt"
 	case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
-		return "input.pptx"
+		return "pptx"
 	case "application/vnd.oasis.opendocument.text":
-		return "input.odt"
+		return "odt"
 	case "application/vnd.apple.pages":
-		return "input.pages"
+		return "pages"
 	case "application/vnd.apple.keynote":
-		return "input.key"
+		return "key"
+	case "application/vnd.apple.iwork":
+		return ""
 	case "application/x-ndjson":
-		return "input.ndjson"
+		return "ndjson"
 	case "application/x-subrip":
-		return "input.srt"
+		return "srt"
 	case "application/x-httpd-php", "application/x-httpd-php-source":
-		return "input.php"
+		return "php"
 	case "application/x-protobuf":
-		return "input.proto"
+		return "proto"
 	case "application/x-terraform":
-		return "input.tf"
+		return "tf"
 	case "application/x-powershell":
-		return "input.ps1"
+		return "ps1"
 	case "application/graphql", "application/x-graphql":
-		return "input.graphql"
+		return "graphql"
 	}
 	sub := mediaType[strings.LastIndexByte(mediaType, '/')+1:]
 	sub = strings.TrimPrefix(sub, "x-")
 	sub = strings.TrimPrefix(sub, "vnd.")
-	return "input." + sub
+	if strings.ContainsAny(sub, "./+") {
+		return ""
+	}
+	return sub
 }
 
 // normalizeMIMEType strips parameters from a MIME string ("image/png;

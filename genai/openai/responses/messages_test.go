@@ -673,4 +673,7 @@ func TestConvertContentToInputItems_IdentityWithMediaKeepsMedia(t *testing.T) {
 	if len(contents) != 2 || contents[0].OfInputText == nil || contents[1].OfInputImage == nil {
 		t.Fatalf("expected text plus image in order, got %+v", contents)
 	}
+	if msg.Phase != "final_answer" {
+		t.Errorf("Phase = %q, want final_answer kept through the degradation", msg.Phase)
+	}
 }
