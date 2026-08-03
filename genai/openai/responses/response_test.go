@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/openai/openai-go/v3/responses"
@@ -33,6 +34,60 @@ func TestConvertResponse_EmptyOutput(t *testing.T) {
 	_, err := convertResponse(resp, "test-origin")
 	if !errors.Is(err, ErrNoOutputInResponse) {
 		t.Errorf("err = %v, want %v", err, ErrNoOutputInResponse)
+	}
+}
+
+// A response whose output items are all of unknown types must fail loud
+// instead of passing as a completed turn with empty content; the error
+// names the skipped types so the operator can see what was dropped.
+func TestConvertResponse_UnknownOnlyOutput(t *testing.T) {
+	raw := []byte(`{
+		"id": "resp-u1",
+		"status": "completed",
+		"output": [
+			{"type": "web_search_call", "id": "ws-1", "status": "completed"},
+			{"type": "image_generation_call", "id": "ig-1", "status": "completed"}
+		]
+	}`)
+
+	var resp responses.Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	_, err := convertResponse(&resp, "test-origin")
+	if !errors.Is(err, ErrNoConsumableOutput) {
+		t.Fatalf("err = %v, want ErrNoConsumableOutput", err)
+	}
+	if !strings.Contains(err.Error(), "image_generation_call, web_search_call") {
+		t.Errorf("err = %q, want the sorted skipped item types listed", err)
+	}
+}
+
+// Unknown item types alongside consumable ones are skipped silently: the
+// forward-compatibility contract is to ignore extensions, not to fail.
+func TestConvertResponse_UnknownAlongsideKnown(t *testing.T) {
+	raw := []byte(`{
+		"id": "resp-u2",
+		"status": "completed",
+		"output": [
+			{"type": "web_search_call", "id": "ws-1", "status": "completed"},
+			{"type": "message", "id": "msg-1", "role": "assistant", "status": "completed",
+				"content": [{"type": "output_text", "text": "found it"}]}
+		]
+	}`)
+
+	var resp responses.Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	got, err := convertResponse(&resp, "test-origin")
+	if err != nil {
+		t.Fatalf("convertResponse: %v", err)
+	}
+	if len(got.Content.Parts) != 1 || got.Content.Parts[0].Text != "found it" {
+		t.Errorf("Content parts = %#v, want the single message text", got.Content)
 	}
 }
 

@@ -54,10 +54,12 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"mime"
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 
@@ -75,6 +77,10 @@ var _ model.LLM = &Model{}
 
 var (
 	ErrNoOutputInResponse = errors.New("no output items in OpenAI Responses API response")
+	// ErrNoConsumableOutput reports a response whose output items were all
+	// skipped (unknown item types, or known items carrying no content), so
+	// converting it would produce an empty completed turn.
+	ErrNoConsumableOutput = errors.New("no consumable output items in OpenAI Responses API response")
 )
 
 // Model implements model.LLM using the OpenAI Responses API.
@@ -302,7 +308,7 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 			case "response.completed", "response.incomplete":
 				resp := &event.Response
 				llmResp, err := convertResponse(resp, m.origin)
-				if err != nil && !errors.Is(err, ErrNoOutputInResponse) {
+				if err != nil && !errors.Is(err, ErrNoOutputInResponse) && !errors.Is(err, ErrNoConsumableOutput) {
 					// A malformed terminal payload (e.g. broken function
 					// arguments) is a real error, not a missing-output case;
 					// degrading to the delta fallback would swallow it.
@@ -314,6 +320,15 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 					// final response from what the stream delivered, otherwise ADK
 					// would persist an empty event and the turn would be lost.
 					llmResp = acc.fallbackResponse(resp, m.origin)
+					if hasNoContent(llmResp) {
+						// Nothing streamed either: surface why the turn is
+						// empty instead of yielding it as completed.
+						if err == nil {
+							err = ErrNoConsumableOutput
+						}
+						yield(nil, err)
+						return
+					}
 				}
 				yield(llmResp, nil)
 				return
@@ -1030,7 +1045,9 @@ func convertResponse(resp *responses.Response, origin string) (*model.LLMRespons
 		Parts: []*genai.Part{},
 	}
 
+	itemTypes := map[string]bool{}
 	for _, item := range resp.Output {
+		itemTypes[item.Type] = true
 		switch item.Type {
 		case "reasoning":
 			// One part per reasoning item, even when the summary is empty:
@@ -1105,6 +1122,13 @@ func convertResponse(resp *responses.Response, origin string) (*model.LLMRespons
 				},
 			})
 		}
+	}
+
+	// Unknown item types are skipped for forward compatibility, but when
+	// nothing consumable remains the turn must not pass as completed: ADK
+	// would persist an empty event with no clue about what was dropped.
+	if len(content.Parts) == 0 {
+		return nil, fmt.Errorf("%w (item types: %s)", ErrNoConsumableOutput, joinSortedKeys(itemTypes))
 	}
 
 	return &model.LLMResponse{
@@ -1989,6 +2013,10 @@ func lowercaseTypes(m map[string]any) {
 }
 
 // convertSchema recursively converts a genai.Schema to JSON schema format.
+// Only Type, Description, Required, Enum, Properties, and Items are carried
+// over; constraints outside this subset (Format, Minimum, Nullable, AnyOf,
+// ...) are dropped. Callers needing full fidelity should pass a raw schema
+// via ResponseJsonSchema instead, which is sent through unmodified.
 func convertSchema(schema *genai.Schema) (map[string]any, error) {
 	if schema == nil {
 		return map[string]any{"type": "object", "properties": map[string]any{}}, nil
@@ -2065,6 +2093,13 @@ func extractText(content *genai.Content) string {
 // joinTexts joins multiple text strings with newlines.
 func joinTexts(texts []string) string {
 	return strings.Join(texts, "\n")
+}
+
+// joinSortedKeys renders a set of item types as a stable comma-separated
+// list for error messages.
+func joinSortedKeys(set map[string]bool) string {
+	keys := slices.Sorted(maps.Keys(set))
+	return strings.Join(keys, ", ")
 }
 
 // parseJSONArgs parses a function-call arguments string into a map. Malformed

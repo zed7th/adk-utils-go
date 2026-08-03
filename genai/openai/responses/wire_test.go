@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -254,6 +255,39 @@ func TestWireBody_StreamMalformedTerminalArguments(t *testing.T) {
 	}
 	if gotErr == nil {
 		t.Fatalf("expected an error for malformed terminal arguments, got none")
+	}
+}
+
+// A terminal event whose output holds only unknown item types, with nothing
+// accumulated from the stream, must surface an error: yielding it as a
+// completed turn would persist an empty event with no trace of what was
+// dropped.
+func TestWireBody_StreamUnknownOnlyTerminal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: response.completed\n")
+		io.WriteString(w, `data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_1","status":"completed","output":[{"type":"web_search_call","id":"ws_1","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	m := New(Config{BaseURL: srv.URL, APIKey: "test-key", ModelName: "gpt-test"})
+
+	req := &model.LLMRequest{Contents: []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+	}}
+	var gotErr error
+	for resp, err := range m.GenerateContent(context.Background(), req, true) {
+		if err != nil {
+			gotErr = err
+			continue
+		}
+		if resp != nil && !resp.Partial && len(resp.Content.Parts) == 0 {
+			t.Fatalf("an empty completed turn was yielded: %+v", resp)
+		}
+	}
+	if !errors.Is(gotErr, ErrNoConsumableOutput) {
+		t.Fatalf("err = %v, want ErrNoConsumableOutput", gotErr)
 	}
 }
 
