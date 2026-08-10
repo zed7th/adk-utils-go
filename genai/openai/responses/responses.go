@@ -1,20 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
 // SPDX-License-Identifier: Apache-2.0
 
-// Copyright 2025 achetronic
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 // Package responses provides an OpenAI Responses API (/v1/responses)
 // implementation for the ADK.
 //
@@ -355,10 +341,14 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 		// The stream ended without any terminal event (some gateways just close
 		// the connection after the last delta). Synthesize the final event from
 		// what was accumulated so the turn is persisted and ADK does not raise
-		// "last event is not final".
+		// "last event is not final". A stream that closed without delivering
+		// anything at all is an error, not a silent zero-event iteration:
+		// overloaded gateways answer 200 with an empty SSE body.
 		if acc.hasContent() || len(acc.items) > 0 {
 			shadow := responses.Response{Status: responses.ResponseStatusCompleted}
 			yield(acc.fallbackResponse(&shadow, m.origin), nil)
+		} else {
+			yield(nil, ErrNoConsumableOutput)
 		}
 	}
 }
@@ -616,7 +606,9 @@ func (m *Model) buildResponseParams(req *model.LLMRequest) (responses.ResponseNe
 	return params, nil
 }
 
-// applyGenerationConfig applies optional generation settings to the request params.
+// applyGenerationConfig applies optional generation settings to the request
+// params. StopSequences is ignored: the Responses API has no stop parameter,
+// so unlike the Chat Completions adapter there is nothing to map it to.
 func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.GenerateContentConfig) error {
 	if cfg.Temperature != nil {
 		params.Temperature = param.NewOpt(float64(*cfg.Temperature))
@@ -730,6 +722,25 @@ func applyGenerationConfig(params *responses.ResponseNewParams, cfg *genai.Gener
 					},
 				}
 			} else {
+				// A multi-name allowlist is enforced by sending only the
+				// allowed function definitions: tool_choice "required" alone
+				// would leave every declared tool callable, and the native
+				// allowed_tools choice is not implemented across
+				// OpenAI-compatible backends (vLLM rejects everything but
+				// "auto" on this endpoint).
+				if len(fcc.AllowedFunctionNames) > 1 {
+					allowed := make(map[string]bool, len(fcc.AllowedFunctionNames))
+					for _, name := range fcc.AllowedFunctionNames {
+						allowed[name] = true
+					}
+					kept := make([]responses.ToolUnionParam, 0, len(fcc.AllowedFunctionNames))
+					for _, tool := range params.Tools {
+						if tool.OfFunction != nil && allowed[tool.OfFunction.Name] {
+							kept = append(kept, tool)
+						}
+					}
+					params.Tools = kept
+				}
 				params.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
 					OfToolChoiceMode: param.NewOpt(responses.ToolChoiceOptionsRequired),
 				}
@@ -819,15 +830,17 @@ func convertContentToInputItems(content *genai.Content, origin string, dangling 
 			return
 		}
 
-		// Model output with a message ID or phase builds an OutputMessage
-		// manually, so the item identity survives the stateless round trip
-		// (models like gpt-5.3-codex expect phase back on every assistant
-		// message, and the API asks for output items to be replayed as-is).
-		// Output message content can only carry text and refusals, so a
-		// message that also holds media (possible in histories written by
-		// other adapters) keeps the media and gives up the identity via the
+		// Model output with a message ID builds an OutputMessage manually,
+		// so the item identity survives the stateless round trip (models
+		// like gpt-5.3-codex expect phase back on every assistant message,
+		// and the API asks for output items to be replayed as-is). The ID is
+		// the gate: OutputMessage requires one, so phase-only content (seen
+		// in histories written by other adapters) goes through the input
+		// message path, which carries phase itself. Output message content
+		// can only carry text and refusals, so a message that also holds
+		// media keeps the media and gives up the identity via the
 		// content-list path instead of silently dropping parts.
-		if role == responses.EasyInputMessageRoleAssistant && (messageID != "" || phase != "") &&
+		if role == responses.EasyInputMessageRoleAssistant && messageID != "" &&
 			len(mediaParts) == 0 {
 			var contentParts []responses.ResponseOutputMessageContentUnionParam
 			for i, t := range textParts {
@@ -857,9 +870,16 @@ func convertContentToInputItems(content *genai.Content, origin string, dangling 
 		} else if len(mediaParts) == 0 {
 			// Type is set explicitly: the OpenAPI spec discriminates input
 			// union items on it, even though the endpoint tolerates its
-			// absence.
+			// absence. Phase is assistant-only: multi-agent histories
+			// relabel other agents' output as user while keeping part
+			// metadata, and the API rejects phase on user messages.
+			msgPhase := responses.EasyInputMessagePhase("")
+			if role == responses.EasyInputMessageRoleAssistant {
+				msgPhase = responses.EasyInputMessagePhase(phase)
+			}
 			items = append(items, responses.ResponseInputItemUnionParam{
 				OfMessage: &responses.EasyInputMessageParam{
+					Phase: msgPhase,
 					Content: responses.EasyInputMessageContentUnionParam{
 						OfString: param.NewOpt(joinTexts(textParts)),
 					},
@@ -927,23 +947,12 @@ func convertContentToInputItems(content *genai.Content, origin string, dangling 
 			))
 
 		case part.Thought:
-			// Reasoning items carrying encrypted content are replayed so the
-			// model keeps its chain of thought across turns; reasoning models
-			// require the reasoning item preceding a function_call to be
-			// present in the input. Skipped instead of replayed when:
-			//   - the content is not an assistant turn: in multi-agent
-			//     histories another agent's output (thoughts included) shows
-			//     up under other roles, where a reasoning item is invalid;
-			//   - there is no encrypted content (e.g. gateways that ignore
-			//     the include parameter): bare IDs only resolve in the
-			//     originating response and replaying them is a 400;
-			//   - the origin does not match: encrypted content is bound to
-			//     the provider/API key/model that produced it, and replaying
-			//     it elsewhere is a 400 invalid_encrypted_content;
-			//   - no item from the same turn follows: the API rejects
-			//     dangling reasoning items.
-			// Skipping degrades gracefully: the model re-derives its
-			// reasoning for the turn instead of the request failing.
+			// Reasoning items with encrypted content are replayed so the
+			// model keeps its chain of thought across turns, as reasoning
+			// models require. Items the API would reject are skipped instead
+			// (non-assistant turns, missing encrypted content, a foreign
+			// origin, no same-turn item following), so the model re-derives
+			// its reasoning rather than the request failing with a 400.
 			if role != responses.EasyInputMessageRoleAssistant {
 				continue
 			}
@@ -1935,6 +1944,34 @@ func makeNullable(prop any) {
 			map[string]any{"type": "null"},
 		}
 		return
+	}
+	// A const admits exactly one value, so widening "type" alone would
+	// leave null failing the const check; the property becomes an anyOf
+	// union of the const and null instead.
+	if c, ok := propMap["const"]; ok {
+		branch := map[string]any{"const": c}
+		if t, ok := propMap["type"]; ok {
+			branch["type"] = t
+		}
+		delete(propMap, "const")
+		delete(propMap, "type")
+		propMap["anyOf"] = []any{branch, map[string]any{"type": "null"}}
+		return
+	}
+	// An enum constrains the value independently of "type", so null must
+	// join the allowed values too or the property stays effectively
+	// required.
+	if values, ok := propMap["enum"].([]any); ok {
+		hasNull := false
+		for _, v := range values {
+			if v == nil {
+				hasNull = true
+				break
+			}
+		}
+		if !hasNull {
+			propMap["enum"] = append(values, nil)
+		}
 	}
 	switch t := propMap["type"].(type) {
 	case string:

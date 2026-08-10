@@ -128,7 +128,9 @@ agent, _ := llmagent.New(llmagent.Config{
 })
 ```
 
-**Which OpenAI adapter should I use?** Pick whichever fits your needs:
+### Choosing between the OpenAI adapters
+
+Pick whichever fits your needs:
 
 | Adapter | When to use |
 |---|---|
@@ -167,8 +169,6 @@ All clients support:
 - Extended thinking: classic budget API (`ThinkingBudgetTokens`) and adaptive effort API (`ThinkingEffort` + `ThinkingMode`)
 - Usage metadata
 - Custom HTTP headers (multi-value)
-
-Remote image URLs (`genai.Part.FileData`) work for image MIME types only; audio and documents still need uploaded bytes via `InlineData`. The URI must be `http(s)`. Plain `http` is allowed because the clients also serve API-compatible gateways (Ollama, vLLM, LiteLLM, ...) that commonly fetch from local http endpoints; which URLs a hosted provider actually fetches is decided on its side. Note that `gs://` URIs are rejected even though `genai.FileData` documents them: no client here can read from Google Cloud Storage, so for GCS-hosted files fetch the bytes and use `InlineData`. Invalid schemes and non-image MIME types fail with a clear error instead of being silently dropped.
 
 Reasoning is exposed differently per provider: Anthropic uses a token budget (`ThinkingBudgetTokens`), while the OpenAI Responses client uses a reasoning effort level (`low` / `medium` / `high`). The OpenAI Responses client additionally supports structured output via JSON Schema.
 

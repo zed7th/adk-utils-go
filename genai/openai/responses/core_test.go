@@ -1,14 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
 // SPDX-License-Identifier: Apache-2.0
 
-// Copyright 2025 achetronic
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-
 package responses
 
 import (
@@ -719,4 +711,49 @@ func TestConvertFunctionParams_RootUnionGoesNonStrict(t *testing.T) {
 			t.Errorf("strict = true, want false for an inlined root oneOf")
 		}
 	})
+}
+
+// An optional property with an enum or a const must stay expressible as
+// absent after strict mode moves it into required: null has to satisfy the
+// value constraint too, not just the widened type, or the property becomes
+// effectively mandatory.
+func TestNormalizeStrictSchema_OptionalEnumAndConstStayNullable(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"mode": map[string]any{"type": "string", "enum": []any{"fast", "slow"}},
+			"kind": map[string]any{"type": "string", "const": "widget"},
+		},
+	}
+
+	normalizeStrictSchema(schema)
+	normalizeStrictSchema(schema) // idempotent: a second pass adds nothing
+
+	props := schema["properties"].(map[string]any)
+
+	mode := props["mode"].(map[string]any)
+	if got, want := fmt.Sprintf("%v", mode["type"]), "[string null]"; got != want {
+		t.Errorf("mode type = %v, want %v", mode["type"], want)
+	}
+	values, _ := mode["enum"].([]any)
+	if len(values) != 3 || values[2] != nil {
+		t.Errorf("mode enum = %v, want [fast slow <nil>]", values)
+	}
+
+	kind := props["kind"].(map[string]any)
+	if _, ok := kind["const"]; ok {
+		t.Errorf("kind = %+v, want the const hoisted into anyOf", kind)
+	}
+	branches, _ := kind["anyOf"].([]any)
+	if len(branches) != 2 {
+		t.Fatalf("kind anyOf branches = %d, want 2 (const plus null): %v", len(branches), branches)
+	}
+	first, _ := branches[0].(map[string]any)
+	if first["const"] != "widget" || first["type"] != "string" {
+		t.Errorf("first branch = %v, want the original const with its type", first)
+	}
+	second, _ := branches[1].(map[string]any)
+	if second["type"] != "null" {
+		t.Errorf("second branch = %v, want {type: null}", second)
+	}
 }
