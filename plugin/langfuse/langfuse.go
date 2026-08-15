@@ -165,18 +165,19 @@ func Setup(cfg *Config) (runner.PluginConfig, func(context.Context) error, error
 // llmCall
 // ---------------------------------------------------------------------------
 
-// llmCall captures the serialised request and response text for a single
+// llmCall captures the serialised request and response payloads for a single
 // generate_content LLM invocation. The enrichingExporter consumes these to
-// inject gcp.vertex.agent.llm_request / llm_response span attributes as
-// well as gen_ai.usage.* token-count attributes so that Langfuse can
-// display costs.
+// inject gen_ai.input.messages / gen_ai.output.messages /
+// gen_ai.system_instructions span attributes (OTel GenAI semconv message
+// schemas) as well as gen_ai.usage.* token counts.
 type llmCall struct {
-	request      string // JSON-encoded prompt (system + messages + tool calls)
-	response     string // plain-text model output or error message
-	model        string // model identifier (e.g. "gemini-2.0-flash")
-	inputTokens  int32
-	outputTokens int32
-	totalTokens  int32
+	inputMessages      string // JSON chat history for gen_ai.input.messages
+	systemInstructions string // JSON parts for gen_ai.system_instructions, "" when absent
+	outputMessages     string // JSON answer (or error) for gen_ai.output.messages
+	model              string // model identifier (e.g. "gemini-2.0-flash")
+	inputTokens        int32
+	outputTokens       int32
+	totalTokens        int32
 }
 
 // ---------------------------------------------------------------------------
@@ -294,20 +295,27 @@ func (e *spanEnricher) beforeModel(ctx agent.Context, req *model.LLMRequest) (*m
 		return nil, nil
 	}
 	spanID := span.SpanContext().SpanID().String()
-	reqJSON, _ := json.Marshal(marshalLLMRequest(req))
+
+	call := llmCall{model: req.Model}
+	if msgs, err := json.Marshal(inputMessages(req.Contents)); err == nil {
+		call.inputMessages = string(msgs)
+	}
+	if parts := systemInstructionParts(req); len(parts) > 0 {
+		if sys, err := json.Marshal(parts); err == nil {
+			call.systemInstructions = string(sys)
+		}
+	}
 
 	e.mu.Lock()
-	e.pending[spanID] = append(e.pending[spanID], llmCall{
-		request: string(reqJSON),
-		model:   req.Model,
-	})
+	e.pending[spanID] = append(e.pending[spanID], call)
 	e.mu.Unlock()
 	return nil, nil
 }
 
-// afterModel attaches the model's response text (or the error) to the
-// pending llmCall. On a final text answer it also propagates the output to
-// the ancestor invoke_agent spans, so Langfuse shows it at trace level.
+// afterModel attaches the model's answer (or the error) to the pending
+// llmCall as semconv output messages. On a final text answer it also
+// propagates the user-visible text to the ancestor invoke_agent spans, so
+// Langfuse shows it at trace level without reasoning noise.
 // "Final" is detected as !Partial + !hasFunctionCalls, not TurnComplete:
 // TurnComplete is only set in streaming mode, and this must work in both.
 func (e *spanEnricher) afterModel(ctx agent.Context, resp *model.LLMResponse, llmErr error) (*model.LLMResponse, error) {
@@ -317,17 +325,21 @@ func (e *spanEnricher) afterModel(ctx agent.Context, resp *model.LLMResponse, ll
 	}
 	spanID := span.SpanContext().SpanID().String()
 
-	var text string
+	var output []map[string]any
 	if llmErr != nil {
-		text = llmErr.Error()
+		output = errorOutputMessages(llmErr)
 	} else if resp != nil && resp.Content != nil {
-		text = contentToText(resp.Content)
+		output = outputMessages(resp)
 	}
 
 	e.mu.Lock()
 	queue := e.pending[spanID]
 	if len(queue) > 0 {
-		queue[len(queue)-1].response = text
+		if output != nil {
+			if out, err := json.Marshal(output); err == nil {
+				queue[len(queue)-1].outputMessages = string(out)
+			}
+		}
 		if resp != nil && resp.UsageMetadata != nil {
 			queue[len(queue)-1].inputTokens = resp.UsageMetadata.PromptTokenCount
 			queue[len(queue)-1].outputTokens = resp.UsageMetadata.CandidatesTokenCount
@@ -336,7 +348,11 @@ func (e *spanEnricher) afterModel(ctx agent.Context, resp *model.LLMResponse, ll
 	}
 	e.mu.Unlock()
 
-	if resp != nil && !resp.Partial && text != "" && !hasFunctionCalls(resp.Content) {
+	if resp != nil && !resp.Partial && !hasFunctionCalls(resp.Content) {
+		text := visibleText(resp.Content)
+		if text == "" {
+			return nil, nil
+		}
 		key := branchKey(ctx)
 		e.mu.Lock()
 		stack := e.agentSpans[key]
@@ -377,10 +393,10 @@ func (e *spanEnricher) popCall(spanID string) (llmCall, bool) {
 // ---------------------------------------------------------------------------
 
 // enrichingExporter wraps a real OTLP SpanExporter and injects
-// gcp.vertex.agent.llm_request / llm_response attributes into
-// generate_content spans just before they are exported. This is necessary
-// because the ADK does not natively attach prompt/response payloads to its
-// OTel spans.
+// gen_ai.input.messages / gen_ai.output.messages / gen_ai.system_instructions
+// attributes into generate_content spans just before they are exported. This
+// is necessary because the ADK emits prompt/response content only on the OTel
+// logs signal, which never reaches Langfuse's trace ingestion.
 //
 // Pending calls are looked up by the parent span ID of each generate_content
 // span - that parent is the invoke_agent span whose ID was used as key by
@@ -400,11 +416,14 @@ func (ex *enrichingExporter) ExportSpans(ctx context.Context, spans []sdktrace.R
 		if strings.HasPrefix(s.Name(), "generate_content") {
 			parentID := s.Parent().SpanID().String()
 			if call, ok := ex.enricher.popCall(parentID); ok {
-				if call.request != "" {
-					extra = append(extra, attribute.String("gcp.vertex.agent.llm_request", call.request))
+				if call.inputMessages != "" {
+					extra = append(extra, attribute.String("gen_ai.input.messages", call.inputMessages))
 				}
-				if call.response != "" {
-					extra = append(extra, attribute.String("gcp.vertex.agent.llm_response", call.response))
+				if call.systemInstructions != "" {
+					extra = append(extra, attribute.String("gen_ai.system_instructions", call.systemInstructions))
+				}
+				if call.outputMessages != "" {
+					extra = append(extra, attribute.String("gen_ai.output.messages", call.outputMessages))
 				}
 				if call.model != "" {
 					extra = append(extra, attribute.String("gen_ai.request.model", call.model))
@@ -475,40 +494,171 @@ func (s *enrichedSpan) InstrumentationLibrary() instrumentation.Scope {
 // helpers
 // ---------------------------------------------------------------------------
 
-// marshalLLMRequest converts an ADK LLMRequest into a JSON-friendly map
-// containing the system instruction and the full message history (text,
-// tool calls, and tool responses). The result is intended for the
-// gcp.vertex.agent.llm_request span attribute.
-func marshalLLMRequest(req *model.LLMRequest) map[string]any {
-	msgs := make([]map[string]any, 0, len(req.Contents))
-	for _, c := range req.Contents {
+// inputMessages converts the request history into semconv chat messages,
+// one message per content with typed parts. A content carrying a tool
+// response is reported under the "tool" role, matching how providers
+// thread tool results back into the conversation.
+func inputMessages(contents []*genai.Content) []map[string]any {
+	msgs := make([]map[string]any, 0, len(contents))
+	for _, c := range contents {
 		if c == nil {
 			continue
 		}
-		for _, p := range c.Parts {
-			switch {
-			case p.Text != "":
-				msgs = append(msgs, map[string]any{"role": c.Role, "content": p.Text})
-			case p.FunctionCall != nil:
-				args, _ := json.Marshal(p.FunctionCall.Args)
-				msgs = append(msgs, map[string]any{
-					"role":      c.Role,
-					"tool_call": map[string]any{"name": p.FunctionCall.Name, "args": string(args)},
-				})
-			case p.FunctionResponse != nil:
-				r, _ := json.Marshal(p.FunctionResponse.Response)
-				msgs = append(msgs, map[string]any{
-					"role":          "tool",
-					"tool_response": map[string]any{"name": p.FunctionResponse.Name, "result": string(r)},
-				})
+		parts := messageParts(c.Parts)
+		if len(parts) == 0 {
+			continue
+		}
+		role := semconvRole(c.Role)
+		if hasFunctionResponse(c) {
+			role = "tool"
+		}
+		msgs = append(msgs, map[string]any{"role": role, "parts": parts})
+	}
+	return msgs
+}
+
+// systemInstructionParts renders the system instruction as semconv parts
+// for the gen_ai.system_instructions attribute; nil when the request has
+// none. Langfuse prepends the attribute as a system message on ingestion.
+func systemInstructionParts(req *model.LLMRequest) []map[string]any {
+	if req.Config == nil || req.Config.SystemInstruction == nil {
+		return nil
+	}
+	return messageParts(req.Config.SystemInstruction.Parts)
+}
+
+// outputMessages renders the model answer as a single semconv output
+// message, keeping reasoning, text and tool calls as separate typed parts.
+func outputMessages(resp *model.LLMResponse) []map[string]any {
+	return []map[string]any{{
+		"role":          "assistant",
+		"parts":         messageParts(resp.Content.Parts),
+		"finish_reason": finishReason(resp),
+	}}
+}
+
+// errorOutputMessages renders a model error as an output message with the
+// semconv "error" finish reason, so failed calls stay visible in Langfuse.
+func errorOutputMessages(err error) []map[string]any {
+	return []map[string]any{{
+		"role":          "assistant",
+		"parts":         []map[string]any{{"type": "text", "content": err.Error()}},
+		"finish_reason": "error",
+	}}
+}
+
+// messageParts converts genai parts to semconv message parts. Reasoning,
+// text, tool calls and tool responses map to their typed parts; inline and
+// file data map to metadata-only parts that never carry payload bytes.
+func messageParts(parts []*genai.Part) []map[string]any {
+	out := make([]map[string]any, 0, len(parts))
+	for _, p := range parts {
+		switch {
+		case p == nil:
+		case p.Text != "" && p.Thought:
+			out = append(out, map[string]any{"type": "reasoning", "content": p.Text})
+		case p.Text != "":
+			out = append(out, map[string]any{"type": "text", "content": p.Text})
+		case p.FunctionCall != nil:
+			part := map[string]any{
+				"type":      "tool_call",
+				"name":      p.FunctionCall.Name,
+				"arguments": p.FunctionCall.Args,
 			}
+			if p.FunctionCall.ID != "" {
+				part["id"] = p.FunctionCall.ID
+			}
+			out = append(out, part)
+		case p.FunctionResponse != nil:
+			part := map[string]any{
+				"type":     "tool_call_response",
+				"name":     p.FunctionResponse.Name,
+				"response": p.FunctionResponse.Response,
+			}
+			if p.FunctionResponse.ID != "" {
+				part["id"] = p.FunctionResponse.ID
+			}
+			out = append(out, part)
+		case p.InlineData != nil:
+			out = append(out, map[string]any{
+				"type":       "blob_omitted",
+				"mime_type":  p.InlineData.MIMEType,
+				"size_bytes": len(p.InlineData.Data),
+			})
+		case p.FileData != nil:
+			out = append(out, map[string]any{
+				"type":      "uri",
+				"modality":  modalityFromMIME(p.FileData.MIMEType),
+				"mime_type": p.FileData.MIMEType,
+				"uri":       p.FileData.FileURI,
+			})
 		}
 	}
-	result := map[string]any{"messages": msgs}
-	if req.Config != nil && req.Config.SystemInstruction != nil {
-		result["system"] = contentToText(req.Config.SystemInstruction)
+	return out
+}
+
+// semconvRole maps a genai content role to the semconv role vocabulary.
+func semconvRole(role string) string {
+	switch role {
+	case genai.RoleModel:
+		return "assistant"
+	case "":
+		return genai.RoleUser
+	default:
+		return role
 	}
-	return result
+}
+
+// finishReason maps the provider finish reason to the semconv vocabulary;
+// unrecognised values pass through lowercased.
+func finishReason(resp *model.LLMResponse) string {
+	if hasFunctionCalls(resp.Content) {
+		return "tool_call"
+	}
+	switch resp.FinishReason {
+	case genai.FinishReasonStop, "":
+		return "stop"
+	case genai.FinishReasonMaxTokens:
+		return "length"
+	case genai.FinishReasonSafety, genai.FinishReasonRecitation, genai.FinishReasonBlocklist,
+		genai.FinishReasonProhibitedContent, genai.FinishReasonSPII, genai.FinishReasonImageSafety:
+		return "content_filter"
+	default:
+		return strings.ToLower(string(resp.FinishReason))
+	}
+}
+
+// modalityFromMIME derives the semconv modality from a MIME type prefix.
+func modalityFromMIME(mime string) string {
+	if i := strings.Index(mime, "/"); i > 0 {
+		return mime[:i]
+	}
+	return "unknown"
+}
+
+// hasFunctionResponse reports whether c contains a FunctionResponse part.
+func hasFunctionResponse(c *genai.Content) bool {
+	for _, p := range c.Parts {
+		if p != nil && p.FunctionResponse != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// visibleText flattens the user-visible text parts of a content, skipping
+// reasoning parts, so trace-level output shows the final answer alone.
+func visibleText(c *genai.Content) string {
+	if c == nil {
+		return ""
+	}
+	var parts []string
+	for _, p := range c.Parts {
+		if p != nil && p.Text != "" && !p.Thought {
+			parts = append(parts, p.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // contentToText flattens a genai.Content into a single human-readable string.

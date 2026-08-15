@@ -27,7 +27,7 @@ Registered as `BeforeAgentCallback`, `AfterAgentCallback`, `BeforeModelCallback`
 | `beforeAgent` | Pushes the current `invoke_agent` span onto a per-branch stack. Decorates it with Langfuse attributes (user ID, session ID, tags, metadata, environment, release, trace name, user input). |
 | `afterAgent` | Pops the span from the per-branch stack. Cleans up when the last span for a branch is removed. |
 | `beforeModel` | Serialises the full LLM prompt (system instruction + message history + tool calls) as JSON. Enqueues it as a pending `llmCall` keyed by the `invoke_agent` span ID. |
-| `afterModel` | Captures the model's response text (or error), token usage (`PromptTokenCount`, `CandidatesTokenCount`, `TotalTokenCount`), and attaches them to the pending `llmCall`. For non-partial final text responses (no function calls), propagates the output to all ancestor `invoke_agent` spans in the same branch. |
+| `afterModel` | Serialises the model's answer (or error) as semconv output messages, captures token usage (`PromptTokenCount`, `CandidatesTokenCount`, `TotalTokenCount`), and attaches them to the pending `llmCall`. For non-partial final text responses (no function calls), propagates the user-visible text (reasoning parts excluded) to all ancestor `invoke_agent` spans in the same branch. |
 
 ### 2. Enriching Exporter (enrichingExporter)
 
@@ -36,8 +36,9 @@ Wraps the real OTLP `SpanExporter`. At export time, for every span named `genera
 1. Looks up the span's parent ID (which is the `invoke_agent` span ID)
 2. Pops the oldest pending `llmCall` for that ID (FIFO queue)
 3. Injects extra attributes into the span:
-   - `gcp.vertex.agent.llm_request`: full serialised prompt
-   - `gcp.vertex.agent.llm_response`: model output text
+   - `gen_ai.input.messages`: chat history as semconv messages
+   - `gen_ai.system_instructions`: system instruction as semconv parts
+   - `gen_ai.output.messages`: model answer as semconv messages
    - `gen_ai.request.model`: model identifier
    - `gen_ai.usage.input_tokens`: prompt token count
    - `gen_ai.usage.output_tokens`: completion token count
@@ -194,26 +195,34 @@ runnr, _ := runner.New(runner.Config{
 
 | Attribute | Source |
 |---|---|
-| `gcp.vertex.agent.llm_request` | JSON-serialised prompt (system + messages + tool calls) |
-| `gcp.vertex.agent.llm_response` | Plain-text model output |
+| `gen_ai.input.messages` | Chat history as semconv messages (typed parts) |
+| `gen_ai.system_instructions` | System instruction as semconv parts |
+| `gen_ai.output.messages` | Model answer as semconv messages (typed parts) |
 | `gen_ai.request.model` | Model identifier from `LLMRequest.Model` |
 | `gen_ai.usage.input_tokens` | `UsageMetadata.PromptTokenCount` |
 | `gen_ai.usage.output_tokens` | `UsageMetadata.CandidatesTokenCount` |
 
 ## LLM Request Serialisation
 
-`marshalLLMRequest` converts the ADK `LLMRequest` to a JSON map with:
+Message content follows the OTel GenAI semconv message schemas
+(gen_ai.input.messages / gen_ai.output.messages), which Langfuse maps to
+observation input/output natively. One message per content, with typed
+parts; reasoning stays separate from user-visible text:
 
 ```json
-{
-  "system": "system instruction text",
-  "messages": [
-    {"role": "user", "content": "hello"},
-    {"role": "model", "tool_call": {"name": "search", "args": "{\"q\":\"foo\"}"}},
-    {"role": "tool", "tool_response": {"name": "search", "result": "{\"results\":[]}"}}
-  ]
-}
+[
+  {"role": "user", "parts": [{"type": "text", "content": "hello"}]},
+  {"role": "assistant", "parts": [
+    {"type": "reasoning", "content": "the user greets me..."},
+    {"type": "tool_call", "id": "c1", "name": "search", "arguments": {"q": "foo"}}
+  ], "finish_reason": "tool_call"},
+  {"role": "tool", "parts": [{"type": "tool_call_response", "id": "c1", "name": "search", "response": {"results": []}}]}
+]
 ```
+
+Inline and file data map to metadata-only parts (`blob_omitted`, `uri`)
+that never carry payload bytes. Model errors become an output message with
+`finish_reason: "error"`.
 
 ## Cost Tracking
 

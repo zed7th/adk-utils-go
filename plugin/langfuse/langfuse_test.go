@@ -356,56 +356,135 @@ func TestHasFunctionCalls(t *testing.T) {
 	}
 }
 
-func TestMarshalLLMRequest(t *testing.T) {
-	req := &model.LLMRequest{
-		Contents: []*genai.Content{
-			{Role: "user", Parts: []*genai.Part{{Text: "hello"}}},
-			{Role: "model", Parts: []*genai.Part{{
-				FunctionCall: &genai.FunctionCall{Name: "search", Args: map[string]any{"q": "test"}},
-			}}},
-			{Role: "user", Parts: []*genai.Part{{
-				FunctionResponse: &genai.FunctionResponse{Name: "search", Response: map[string]any{"r": "ok"}},
-			}}},
-			nil,
-		},
-		Config: &genai.GenerateContentConfig{
-			SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: "You are helpful."}}},
-		},
-	}
-
-	result := marshalLLMRequest(req)
-	msgs, ok := result["messages"].([]map[string]any)
-	if !ok {
-		t.Fatal("messages should be a slice of maps")
-	}
+func TestInputMessages(t *testing.T) {
+	msgs := inputMessages([]*genai.Content{
+		{Role: "user", Parts: []*genai.Part{{Text: "hello"}}},
+		{Role: "model", Parts: []*genai.Part{{
+			FunctionCall: &genai.FunctionCall{ID: "c1", Name: "search", Args: map[string]any{"q": "test"}},
+		}}},
+		{Role: "user", Parts: []*genai.Part{{
+			FunctionResponse: &genai.FunctionResponse{ID: "c1", Name: "search", Response: map[string]any{"r": "ok"}},
+		}}},
+		nil,
+	})
 	if len(msgs) != 3 {
 		t.Fatalf("expected 3 messages, got %d", len(msgs))
 	}
-	if msgs[0]["role"] != "user" || msgs[0]["content"] != "hello" {
-		t.Errorf("msg[0] unexpected: %v", msgs[0])
+	if msgs[0]["role"] != "user" {
+		t.Errorf("msg[0] role: %v", msgs[0]["role"])
 	}
-	if msgs[1]["role"] != "model" {
+	parts := msgs[0]["parts"].([]map[string]any)
+	if len(parts) != 1 || parts[0]["type"] != "text" || parts[0]["content"] != "hello" {
+		t.Errorf("msg[0] parts unexpected: %v", parts)
+	}
+	if msgs[1]["role"] != "assistant" {
 		t.Errorf("msg[1] role: %v", msgs[1]["role"])
 	}
-	tc, ok := msgs[1]["tool_call"].(map[string]any)
-	if !ok || tc["name"] != "search" {
-		t.Errorf("msg[1] tool_call unexpected: %v", msgs[1])
+	tc := msgs[1]["parts"].([]map[string]any)[0]
+	if tc["type"] != "tool_call" || tc["name"] != "search" || tc["id"] != "c1" {
+		t.Errorf("msg[1] tool_call unexpected: %v", tc)
 	}
 	if msgs[2]["role"] != "tool" {
 		t.Errorf("msg[2] role: %v", msgs[2]["role"])
 	}
-	if result["system"] != "You are helpful." {
-		t.Errorf("system: %v", result["system"])
+	tr := msgs[2]["parts"].([]map[string]any)[0]
+	if tr["type"] != "tool_call_response" || tr["id"] != "c1" {
+		t.Errorf("msg[2] tool_response unexpected: %v", tr)
 	}
 }
 
-func TestMarshalLLMRequest_NoSystem(t *testing.T) {
-	req := &model.LLMRequest{
+func TestSystemInstructionParts(t *testing.T) {
+	withSys := &model.LLMRequest{
+		Config: &genai.GenerateContentConfig{
+			SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: "You are helpful."}}},
+		},
+	}
+	parts := systemInstructionParts(withSys)
+	if len(parts) != 1 || parts[0]["type"] != "text" || parts[0]["content"] != "You are helpful." {
+		t.Errorf("system parts unexpected: %v", parts)
+	}
+	noSys := &model.LLMRequest{
 		Contents: []*genai.Content{{Role: "user", Parts: []*genai.Part{{Text: "hi"}}}},
 	}
-	result := marshalLLMRequest(req)
-	if _, ok := result["system"]; ok {
-		t.Error("should not have system key when no system instruction")
+	if parts := systemInstructionParts(noSys); len(parts) != 0 {
+		t.Errorf("expected no system parts, got %v", parts)
+	}
+}
+
+func TestMessageParts_TypedParts(t *testing.T) {
+	parts := messageParts([]*genai.Part{
+		{Text: "planning the answer", Thought: true},
+		{Text: "the answer"},
+		{InlineData: &genai.Blob{MIMEType: "image/webp", Data: []byte{1, 2, 3}}},
+		{FileData: &genai.FileData{MIMEType: "image/png", FileURI: "https://x/y.png"}},
+		nil,
+	})
+	if len(parts) != 4 {
+		t.Fatalf("expected 4 parts, got %d", len(parts))
+	}
+	if parts[0]["type"] != "reasoning" || parts[0]["content"] != "planning the answer" {
+		t.Errorf("reasoning part unexpected: %v", parts[0])
+	}
+	if parts[1]["type"] != "text" || parts[1]["content"] != "the answer" {
+		t.Errorf("text part unexpected: %v", parts[1])
+	}
+	if parts[2]["type"] != "blob_omitted" || parts[2]["size_bytes"] != 3 {
+		t.Errorf("blob part unexpected: %v", parts[2])
+	}
+	if parts[3]["type"] != "uri" || parts[3]["modality"] != "image" || parts[3]["uri"] != "https://x/y.png" {
+		t.Errorf("uri part unexpected: %v", parts[3])
+	}
+}
+
+func TestOutputMessages_FinishReason(t *testing.T) {
+	toolCall := &model.LLMResponse{Content: &genai.Content{Parts: []*genai.Part{
+		{FunctionCall: &genai.FunctionCall{Name: "f"}},
+	}}}
+	if got := outputMessages(toolCall)[0]["finish_reason"]; got != "tool_call" {
+		t.Errorf("tool call finish reason: %v", got)
+	}
+	for fr, want := range map[genai.FinishReason]string{
+		genai.FinishReasonStop:      "stop",
+		"":                          "stop",
+		genai.FinishReasonMaxTokens: "length",
+		genai.FinishReasonSafety:    "content_filter",
+		"WEIRD_NEW_REASON":          "weird_new_reason",
+	} {
+		resp := &model.LLMResponse{
+			FinishReason: fr,
+			Content:      &genai.Content{Parts: []*genai.Part{{Text: "t"}}},
+		}
+		if got := outputMessages(resp)[0]["finish_reason"]; got != want {
+			t.Errorf("finish reason %q: got %v, want %q", fr, got, want)
+		}
+	}
+}
+
+func TestErrorOutputMessages(t *testing.T) {
+	msgs := errorOutputMessages(errors.New("rate limit exceeded"))
+	if msgs[0]["role"] != "assistant" || msgs[0]["finish_reason"] != "error" {
+		t.Errorf("error message envelope unexpected: %v", msgs[0])
+	}
+	part := msgs[0]["parts"].([]map[string]any)[0]
+	if part["type"] != "text" || part["content"] != "rate limit exceeded" {
+		t.Errorf("error part unexpected: %v", part)
+	}
+}
+
+func TestVisibleText_SkipsReasoning(t *testing.T) {
+	if got := visibleText(nil); got != "" {
+		t.Errorf("nil content: %q", got)
+	}
+	c := &genai.Content{Parts: []*genai.Part{
+		{Text: "thinking hard", Thought: true},
+		{Text: "the answer"},
+	}}
+	if got := visibleText(c); got != "the answer" {
+		t.Errorf("visibleText() = %q", got)
+	}
+	onlyThought := &genai.Content{Parts: []*genai.Part{{Text: "hmm", Thought: true}}}
+	if got := visibleText(onlyThought); got != "" {
+		t.Errorf("thought-only content should be empty, got %q", got)
 	}
 }
 
@@ -612,8 +691,15 @@ func TestSpanEnricher_BeforeAfterModel_PendingQueue(t *testing.T) {
 	call := e.pending[spanID][0]
 	e.mu.Unlock()
 
-	if call.response != "hi there" {
-		t.Errorf("response: %q", call.response)
+	var out []map[string]any
+	if err := json.Unmarshal([]byte(call.outputMessages), &out); err != nil {
+		t.Fatalf("outputMessages not valid JSON: %v", err)
+	}
+	if out[0]["role"] != "assistant" || out[0]["finish_reason"] != "stop" {
+		t.Errorf("output envelope unexpected: %v", out[0])
+	}
+	if !strings.Contains(call.outputMessages, `"hi there"`) {
+		t.Errorf("outputMessages: %q", call.outputMessages)
 	}
 	if call.inputTokens != 100 || call.outputTokens != 20 || call.totalTokens != 120 {
 		t.Errorf("tokens: in=%d out=%d total=%d", call.inputTokens, call.outputTokens, call.totalTokens)
@@ -636,10 +722,11 @@ func TestSpanEnricher_AfterModel_CapturesError(t *testing.T) {
 	e.afterModel(ctx, nil, errors.New("rate limit exceeded"))
 
 	e.mu.Lock()
-	if e.pending[spanID][0].response != "rate limit exceeded" {
-		t.Errorf("error response: %q", e.pending[spanID][0].response)
-	}
+	out := e.pending[spanID][0].outputMessages
 	e.mu.Unlock()
+	if !strings.Contains(out, "rate limit exceeded") || !strings.Contains(out, `"finish_reason":"error"`) {
+		t.Errorf("error output: %q", out)
+	}
 	span.End()
 }
 
@@ -733,15 +820,15 @@ func TestSpanEnricher_AfterModel_FinalTextSetsOutput(t *testing.T) {
 func TestPopCall_FIFO(t *testing.T) {
 	e := newSpanEnricher()
 	e.pending["span-1"] = []llmCall{
-		{request: "req1", model: "m1"},
-		{request: "req2", model: "m2"},
-		{request: "req3", model: "m3"},
+		{inputMessages: "req1", model: "m1"},
+		{inputMessages: "req2", model: "m2"},
+		{inputMessages: "req3", model: "m3"},
 	}
 
 	for i, want := range []string{"req1", "req2", "req3"} {
 		call, ok := e.popCall("span-1")
-		if !ok || call.request != want {
-			t.Errorf("pop %d: ok=%v request=%q", i, ok, call.request)
+		if !ok || call.inputMessages != want {
+			t.Errorf("pop %d: ok=%v inputMessages=%q", i, ok, call.inputMessages)
 		}
 	}
 	if _, ok := e.popCall("span-1"); ok {
@@ -776,11 +863,12 @@ func TestEnrichingExporter_EnrichesGenerateContent(t *testing.T) {
 	parentID := invokeSpan.SpanContext().SpanID().String()
 
 	e.pending[parentID] = []llmCall{{
-		request:      `{"messages":[{"role":"user","content":"hi"}]}`,
-		response:     "hello!",
-		model:        "claude-sonnet-4-6",
-		inputTokens:  50,
-		outputTokens: 10,
+		inputMessages:      `[{"role":"user","parts":[{"type":"text","content":"hi"}]}]`,
+		systemInstructions: `[{"type":"text","content":"Be nice."}]`,
+		outputMessages:     `[{"role":"assistant","parts":[{"type":"text","content":"hello!"}],"finish_reason":"stop"}]`,
+		model:              "claude-sonnet-4-6",
+		inputTokens:        50,
+		outputTokens:       10,
 	}}
 
 	_, genSpan := tracer.Start(invokeCtx, "generate_content")
@@ -798,8 +886,9 @@ func TestEnrichingExporter_EnrichesGenerateContent(t *testing.T) {
 		t.Fatal("no generate_content span found")
 	}
 
-	assertAttr(t, genS, "gcp.vertex.agent.llm_request", `{"messages":[{"role":"user","content":"hi"}]}`)
-	assertAttr(t, genS, "gcp.vertex.agent.llm_response", "hello!")
+	assertAttr(t, genS, "gen_ai.input.messages", `[{"role":"user","parts":[{"type":"text","content":"hi"}]}]`)
+	assertAttr(t, genS, "gen_ai.system_instructions", `[{"type":"text","content":"Be nice."}]`)
+	assertAttr(t, genS, "gen_ai.output.messages", `[{"role":"assistant","parts":[{"type":"text","content":"hello!"}],"finish_reason":"stop"}]`)
 	assertAttr(t, genS, "gen_ai.request.model", "claude-sonnet-4-6")
 
 	v, ok := spanAttr(genS, "gen_ai.usage.input_tokens")
@@ -828,7 +917,7 @@ func TestEnrichingExporter_PassesThroughNonGenerateContent(t *testing.T) {
 	if len(spans) != 1 {
 		t.Fatalf("expected 1 span, got %d", len(spans))
 	}
-	if _, ok := spanAttr(spans[0], "gcp.vertex.agent.llm_request"); ok {
+	if _, ok := spanAttr(spans[0], "gen_ai.input.messages"); ok {
 		t.Error("non-generate_content should not be enriched")
 	}
 	assertAttr(t, spans[0], "existing", "value")
@@ -849,7 +938,7 @@ func TestEnrichingExporter_NoPendingCall(t *testing.T) {
 
 	for _, s := range rec.Spans() {
 		if strings.HasPrefix(s.Name(), "generate_content") {
-			if _, ok := spanAttr(s, "gcp.vertex.agent.llm_request"); ok {
+			if _, ok := spanAttr(s, "gen_ai.input.messages"); ok {
 				t.Error("should not enrich when no pending call")
 			}
 		}
@@ -865,7 +954,7 @@ func TestEnrichingExporter_ZeroTokensNotSet(t *testing.T) {
 
 	parentCtx, parentSpan := tracer.Start(context.Background(), "invoke_agent")
 	parentID := parentSpan.SpanContext().SpanID().String()
-	e.pending[parentID] = []llmCall{{request: "req", model: "m", inputTokens: 0, outputTokens: 0}}
+	e.pending[parentID] = []llmCall{{inputMessages: "req", model: "m", inputTokens: 0, outputTokens: 0}}
 
 	_, genSpan := tracer.Start(parentCtx, "generate_content")
 	genSpan.End()
@@ -891,8 +980,8 @@ func TestEnrichingExporter_MultipleBatch(t *testing.T) {
 	parent1Ctx, parent1 := tracer.Start(context.Background(), "invoke_agent_1")
 	parent2Ctx, parent2 := tracer.Start(context.Background(), "invoke_agent_2")
 
-	e.pending[parent1.SpanContext().SpanID().String()] = []llmCall{{model: "m1", request: "r1", inputTokens: 10, outputTokens: 5}}
-	e.pending[parent2.SpanContext().SpanID().String()] = []llmCall{{model: "m2", request: "r2", inputTokens: 20, outputTokens: 15}}
+	e.pending[parent1.SpanContext().SpanID().String()] = []llmCall{{model: "m1", inputMessages: "r1", inputTokens: 10, outputTokens: 5}}
+	e.pending[parent2.SpanContext().SpanID().String()] = []llmCall{{model: "m2", inputMessages: "r2", inputTokens: 20, outputTokens: 15}}
 
 	_, g1 := tracer.Start(parent1Ctx, "generate_content")
 	_, g2 := tracer.Start(parent2Ctx, "generate_content")
@@ -926,7 +1015,7 @@ func TestEnrichedSpan_AttributesMerge(t *testing.T) {
 
 	parentCtx, parentSpan := tracer.Start(context.Background(), "invoke_agent")
 	parentID := parentSpan.SpanContext().SpanID().String()
-	e.pending[parentID] = []llmCall{{request: "r", model: "m", inputTokens: 1, outputTokens: 1}}
+	e.pending[parentID] = []llmCall{{inputMessages: "r", model: "m", inputTokens: 1, outputTokens: 1}}
 
 	_, genSpan := tracer.Start(parentCtx, "generate_content")
 	genSpan.SetAttributes(attribute.String("original", "yes"))
@@ -1010,7 +1099,19 @@ func TestFullFlow_SingleTurn(t *testing.T) {
 	}
 
 	assertAttr(t, genS, "gen_ai.request.model", "claude-sonnet-4-6")
-	assertAttr(t, genS, "gcp.vertex.agent.llm_response", "Kubernetes is a container orchestration platform.")
+
+	ov, ok := spanAttr(genS, "gen_ai.output.messages")
+	if !ok {
+		t.Fatal("missing gen_ai.output.messages")
+	}
+	var out []map[string]any
+	json.Unmarshal([]byte(ov.AsString()), &out)
+	if out[0]["role"] != "assistant" || out[0]["finish_reason"] != "stop" {
+		t.Errorf("output envelope unexpected: %v", out[0])
+	}
+	if !strings.Contains(ov.AsString(), "container orchestration platform") {
+		t.Errorf("output text missing: %s", ov.AsString())
+	}
 
 	v, _ := spanAttr(genS, "gen_ai.usage.input_tokens")
 	if v.AsInt64() != 150 {
@@ -1021,11 +1122,10 @@ func TestFullFlow_SingleTurn(t *testing.T) {
 		t.Errorf("output_tokens: %d", v.AsInt64())
 	}
 
-	var reqData map[string]any
-	rv, _ := spanAttr(genS, "gcp.vertex.agent.llm_request")
-	json.Unmarshal([]byte(rv.AsString()), &reqData)
-	if reqData["system"] != "You are a k8s expert." {
-		t.Errorf("system in request: %v", reqData["system"])
+	assertAttr(t, genS, "gen_ai.system_instructions", `[{"content":"You are a k8s expert.","type":"text"}]`)
+	iv, _ := spanAttr(genS, "gen_ai.input.messages")
+	if !strings.Contains(iv.AsString(), `"what is k8s?"`) {
+		t.Errorf("input messages missing user text: %s", iv.AsString())
 	}
 }
 
@@ -1147,8 +1247,8 @@ func TestSpanEnricher_ConcurrentAccess(t *testing.T) {
 				t.Errorf("goroutine %d: no pending call", id)
 				return
 			}
-			if call.response != fmt.Sprintf("a%d", id) {
-				t.Errorf("goroutine %d: response %q", id, call.response)
+			if !strings.Contains(call.outputMessages, fmt.Sprintf(`"a%d"`, id)) {
+				t.Errorf("goroutine %d: output %q", id, call.outputMessages)
 			}
 
 			e.afterAgent(ctx)
