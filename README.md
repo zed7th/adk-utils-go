@@ -18,8 +18,9 @@ This repository provides production-ready implementations for:
 
 ```
 ├── genai/            # LLM client implementations
-│   ├── openai/       # OpenAI Chat Completions client (works with Ollama, OpenRouter, etc.)
-│   │   └── responses/  # OpenAI Responses API client (/v1/responses)
+│   ├── openai/
+│   │   ├── completions/  # OpenAI Chat Completions client (works with Ollama, OpenRouter, etc.)
+│   │   └── responses/    # OpenAI Responses API client (/v1/responses)
 │   └── anthropic/    # Anthropic Claude client
 ├── session/          # Session service implementations
 │   └── redis/        # Redis session service
@@ -196,7 +197,7 @@ Pick whichever fits your needs:
 | Adapter | When to use |
 |---|---|
 | `genai/openai/responses` (Responses API) | OpenAI's recommended API: native reasoning items and structured output |
-| `genai/openai` (Chat Completions) | OpenAI-compatible gateways: Ollama, vLLM, DeepSeek, Kimi, etc. |
+| `genai/openai/completions` (Chat Completions) | OpenAI-compatible gateways: Ollama, vLLM, DeepSeek, Kimi, etc. |
 
 Both OpenAI clients share the same `Config` fields (`APIKey`, `BaseURL`, `ModelName`, `HTTPOptions`). Reasoning is controlled per request through the ADK generation config: a `ThinkingConfig` maps to the Responses `reasoning.effort` level (`low` / `medium` / `high`) rather than a fixed token budget. Structured output is enabled by setting a response schema (JSON Schema) on the generation config.
 
