@@ -945,9 +945,15 @@ func convertContentToInputItems(content *genai.Content, origin string, dangling 
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal function response: %w", err)
 			}
-			items = append(items, responses.ResponseInputItemParamOfFunctionCallOutput(
-				part.FunctionResponse.ID, string(responseJSON),
-			))
+			// Built directly: since openai-go v3.54 the FunctionCallOutput
+			// helper takes only the output and no longer sets call_id.
+			fnOutput := responses.ResponseInputItemFunctionCallOutputParam{
+				CallID: param.NewOpt(part.FunctionResponse.ID),
+			}
+			fnOutput.Output.OfString = param.NewOpt(string(responseJSON))
+			items = append(items, responses.ResponseInputItemUnionParam{
+				OfFunctionCallOutput: &fnOutput,
+			})
 
 		case part.FunctionCall != nil:
 			if common.IsADKInternalCall(part.FunctionCall.Name) {
