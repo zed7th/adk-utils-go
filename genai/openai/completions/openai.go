@@ -1065,15 +1065,19 @@ func normalizeMIMEType(mimeType string) string {
 // input rate) maps to CachedContentTokenCount. Both are documented Chat
 // Completions fields, so they are always mapped. A provider that omits a
 // detail leaves it at zero, and genai's omitempty drops it on the wire.
+//
+// genai 口径下 CandidatesTokenCount 不含推理 token(ADK 遥测与下游计费按它与 ThoughtsTokenCount
+// 相加得到输出总数),而 completion_tokens 已经包含推理,这里减掉推理部分。
 func convertUsageMetadata(usage openai.CompletionUsage) *genai.GenerateContentResponseUsageMetadata {
 	if usage.TotalTokens == 0 {
 		return nil
 	}
+	reasoning := usage.CompletionTokensDetails.ReasoningTokens
 	return &genai.GenerateContentResponseUsageMetadata{
 		PromptTokenCount:        int32(usage.PromptTokens),
-		CandidatesTokenCount:    int32(usage.CompletionTokens),
+		CandidatesTokenCount:    int32(max(usage.CompletionTokens-reasoning, 0)),
 		TotalTokenCount:         int32(usage.TotalTokens),
-		ThoughtsTokenCount:      int32(usage.CompletionTokensDetails.ReasoningTokens),
+		ThoughtsTokenCount:      int32(reasoning),
 		CachedContentTokenCount: int32(usage.PromptTokensDetails.CachedTokens),
 	}
 }

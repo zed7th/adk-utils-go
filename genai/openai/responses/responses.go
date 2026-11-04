@@ -1487,15 +1487,19 @@ func normalizeMIMEType(mimeType string) string {
 }
 
 // convertUsageMetadata converts Responses API usage stats to genai format.
+//
+// genai 口径下 CandidatesTokenCount 不含推理 token(推理单独放 ThoughtsTokenCount,ADK 遥测与
+// 下游计费按两者相加得到输出总数),而 Responses API 的 output_tokens 已经包含推理,这里减掉推理部分。
 func convertUsageMetadata(usage responses.ResponseUsage) *genai.GenerateContentResponseUsageMetadata {
 	if usage.TotalTokens == 0 {
 		return nil
 	}
+	reasoning := usage.OutputTokensDetails.ReasoningTokens
 	return &genai.GenerateContentResponseUsageMetadata{
 		PromptTokenCount:        int32(usage.InputTokens),
-		CandidatesTokenCount:    int32(usage.OutputTokens),
+		CandidatesTokenCount:    int32(max(usage.OutputTokens-reasoning, 0)),
 		TotalTokenCount:         int32(usage.TotalTokens),
-		ThoughtsTokenCount:      int32(usage.OutputTokensDetails.ReasoningTokens),
+		ThoughtsTokenCount:      int32(reasoning),
 		CachedContentTokenCount: int32(usage.InputTokensDetails.CachedTokens),
 	}
 }

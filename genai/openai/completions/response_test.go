@@ -526,7 +526,8 @@ func TestConvertUsageMetadata_WithTokenDetails(t *testing.T) {
 		}
 		// Ensure the rest of the mapping is unchanged: a regression that
 		// rewrites the field assignments could silently zero one of these.
-		if got.PromptTokenCount != 10 || got.CandidatesTokenCount != 50 || got.TotalTokenCount != 60 {
+		// completion_tokens 50 含推理 42,genai 口径的 Candidates 不含推理
+		if got.PromptTokenCount != 10 || got.CandidatesTokenCount != 8 || got.TotalTokenCount != 60 {
 			t.Errorf("usage mapping drifted: %#v", got)
 		}
 	})

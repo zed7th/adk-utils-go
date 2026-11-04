@@ -544,9 +544,10 @@ func TestConvertUsageMetadata(t *testing.T) {
 		if got == nil {
 			t.Fatalf("got nil")
 		}
+		// output_tokens 22 含推理 8,genai 口径的 Candidates 不含推理
 		want := &genai.GenerateContentResponseUsageMetadata{
 			PromptTokenCount:        11,
-			CandidatesTokenCount:    22,
+			CandidatesTokenCount:    14,
 			TotalTokenCount:         33,
 			ThoughtsTokenCount:      8,
 			CachedContentTokenCount: 5,
