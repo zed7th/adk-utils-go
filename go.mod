@@ -1,4 +1,4 @@
-module github.com/achetronic/adk-utils-go
+module github.com/zed7th/adk-utils-go
 
 go 1.25.7
 

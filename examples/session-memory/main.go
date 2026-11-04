@@ -32,8 +32,8 @@ import (
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/genai"
 
-	"github.com/achetronic/adk-utils-go/genai/openai/completions"
-	sessionredis "github.com/achetronic/adk-utils-go/session/redis"
+	"github.com/zed7th/adk-utils-go/genai/openai/completions"
+	sessionredis "github.com/zed7th/adk-utils-go/session/redis"
 )
 
 const (

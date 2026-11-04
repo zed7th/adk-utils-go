@@ -17,7 +17,7 @@ import (
 // "tools.N.custom.input_schema: JSON schema is invalid". This test pins down
 // the contract: every "type" field, at every depth, lands in lower-case.
 //
-// Issue: https://github.com/achetronic/adk-utils-go/issues/15
+// Issue: https://github.com/zed7th/adk-utils-go/issues/15
 func TestConvertTools_LowercasesNestedSchemaTypes(t *testing.T) {
 	m := &Model{modelName: "test-model"}
 

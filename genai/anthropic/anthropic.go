@@ -17,9 +17,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/achetronic/adk-utils-go/genai/common"
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/zed7th/adk-utils-go/genai/common"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )

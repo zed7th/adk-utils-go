@@ -31,9 +31,9 @@ import (
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/genai"
 
-	"github.com/achetronic/adk-utils-go/genai/openai/completions"
-	memorypostgres "github.com/achetronic/adk-utils-go/memory/postgres"
-	memorytools "github.com/achetronic/adk-utils-go/tools/memory"
+	"github.com/zed7th/adk-utils-go/genai/openai/completions"
+	memorypostgres "github.com/zed7th/adk-utils-go/memory/postgres"
+	memorytools "github.com/zed7th/adk-utils-go/tools/memory"
 )
 
 const (

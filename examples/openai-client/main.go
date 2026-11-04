@@ -28,7 +28,7 @@ import (
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/genai"
 
-	"github.com/achetronic/adk-utils-go/genai/openai/completions"
+	"github.com/zed7th/adk-utils-go/genai/openai/completions"
 )
 
 func main() {

@@ -38,8 +38,8 @@ import (
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/genai"
 
-	genaianthropic "github.com/achetronic/adk-utils-go/genai/anthropic"
-	"github.com/achetronic/adk-utils-go/plugin/contextguard"
+	genaianthropic "github.com/zed7th/adk-utils-go/genai/anthropic"
+	"github.com/zed7th/adk-utils-go/plugin/contextguard"
 )
 
 func main() {

@@ -49,12 +49,12 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/achetronic/adk-utils-go/genai/common"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared"
+	"github.com/zed7th/adk-utils-go/genai/common"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )

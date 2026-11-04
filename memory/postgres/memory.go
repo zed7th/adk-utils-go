@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/achetronic/adk-utils-go/memory/memorytypes"
 	_ "github.com/lib/pq"
+	"github.com/zed7th/adk-utils-go/memory/memorytypes"
 	"google.golang.org/adk/v2/memory"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/genai"

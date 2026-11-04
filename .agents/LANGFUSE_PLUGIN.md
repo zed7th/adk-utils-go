@@ -4,7 +4,7 @@ ADK plugin that exports traces to [Langfuse](https://langfuse.com) via OTLP/HTTP
 
 ## Package
 
-`github.com/achetronic/adk-utils-go/plugin/langfuse`
+`github.com/zed7th/adk-utils-go/plugin/langfuse`
 
 ## Files
 

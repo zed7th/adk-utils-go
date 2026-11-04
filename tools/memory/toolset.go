@@ -8,7 +8,7 @@ import (
 	"iter"
 	"time"
 
-	"github.com/achetronic/adk-utils-go/memory/memorytypes"
+	"github.com/zed7th/adk-utils-go/memory/memorytypes"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/memory"
 	"google.golang.org/adk/v2/model"

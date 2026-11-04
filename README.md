@@ -39,7 +39,7 @@ This repository provides production-ready implementations for:
 ## Installation
 
 ```bash
-go get github.com/achetronic/adk-utils-go
+go get github.com/zed7th/adk-utils-go
 ```
 
 ## LLM Clients
@@ -49,7 +49,7 @@ go get github.com/achetronic/adk-utils-go
 Works with OpenAI API and any OpenAI-compatible API (Ollama, OpenRouter, Azure OpenAI, etc.):
 
 ```go
-import "github.com/achetronic/adk-utils-go/genai/openai/completions"
+import "github.com/zed7th/adk-utils-go/genai/openai/completions"
 
 llmModel := completions.New(completions.Config{
     APIKey:    os.Getenv("OPENAI_API_KEY"),
@@ -129,7 +129,7 @@ llmModel := completions.New(completions.Config{
 Native Anthropic Claude support:
 
 ```go
-import genaianthropic "github.com/achetronic/adk-utils-go/genai/anthropic"
+import genaianthropic "github.com/zed7th/adk-utils-go/genai/anthropic"
 
 llmModel := genaianthropic.New(genaianthropic.Config{
     APIKey:    os.Getenv("ANTHROPIC_API_KEY"),
@@ -177,7 +177,7 @@ When streaming, the reasoning is emitted as partial content parts flagged `Thoug
 An adapter for the OpenAI [Responses API](https://platform.openai.com/docs/api-reference/responses) (`/v1/responses`): the interface OpenAI recommends for new applications, with native reasoning, built-in tools, and structured output. The adapter runs the API statelessly (ADK owns the conversation state and replays the full history on each call), so it integrates exactly like the Chat Completions client:
 
 ```go
-import genairesponses "github.com/achetronic/adk-utils-go/genai/openai/responses"
+import genairesponses "github.com/zed7th/adk-utils-go/genai/openai/responses"
 
 llmModel := genairesponses.New(genairesponses.Config{
     APIKey:    os.Getenv("OPENAI_API_KEY"),
@@ -241,7 +241,7 @@ Remote URLs (`genai.Part.FileData`) work for image MIME types in every client; t
 Persistent session storage with Redis:
 
 ```go
-import sessionredis "github.com/achetronic/adk-utils-go/session/redis"
+import sessionredis "github.com/zed7th/adk-utils-go/session/redis"
 
 sessionService, _ := sessionredis.NewRedisSessionService(sessionredis.RedisSessionServiceConfig{
     Addr:     "localhost:6379",
@@ -261,7 +261,7 @@ runner, _ := runner.New(runner.Config{
 Long-term memory with semantic search:
 
 ```go
-import memorypostgres "github.com/achetronic/adk-utils-go/memory/postgres"
+import memorypostgres "github.com/zed7th/adk-utils-go/memory/postgres"
 
 memoryService, _ := memorypostgres.NewPostgresMemoryService(ctx, memorypostgres.PostgresMemoryServiceConfig{
     ConnString: "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable",
@@ -282,7 +282,7 @@ runner, _ := runner.New(runner.Config{
 Give agents explicit control over long-term memory:
 
 ```go
-import memorytools "github.com/achetronic/adk-utils-go/tools/memory"
+import memorytools "github.com/zed7th/adk-utils-go/tools/memory"
 
 memoryToolset, _ := memorytools.NewToolset(memorytools.ToolsetConfig{
     MemoryService: memoryService,
@@ -304,7 +304,7 @@ The toolset provides:
 Versioned artifact storage backed by the local filesystem. Agents can save, load, list, and delete files (code, documents, data) that are delivered to the user as downloadable content.
 
 ```go
-import artifactfs "github.com/achetronic/adk-utils-go/artifact/filesystem"
+import artifactfs "github.com/zed7th/adk-utils-go/artifact/filesystem"
 
 artifactService, _ := artifactfs.NewFilesystemService(artifactfs.FilesystemServiceConfig{
     BasePath: "data/artifacts",
@@ -329,7 +329,7 @@ Supports all ADK agent topologies: single agents, sequential delegation, Sequent
 ### Setup
 
 ```go
-import "github.com/achetronic/adk-utils-go/plugin/langfuse"
+import "github.com/zed7th/adk-utils-go/plugin/langfuse"
 
 pluginCfg, shutdown, err := langfuse.Setup(&langfuse.Config{
     PublicKey:   os.Getenv("LANGFUSE_PUBLIC_KEY"),
@@ -438,7 +438,7 @@ Automatic context window management that prevents conversations from exceeding t
 The plugin requires a `ModelRegistry` to look up context window sizes. The built-in `CrushRegistry` ships catwalk's embedded model database, compiled into the binary: no network calls and no lifecycle to manage.
 
 ```go
-import "github.com/achetronic/adk-utils-go/plugin/contextguard"
+import "github.com/zed7th/adk-utils-go/plugin/contextguard"
 
 // 1. Create the registry (built-in, embedded model database)
 registry := contextguard.NewCrushRegistry()

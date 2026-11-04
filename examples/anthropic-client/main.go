@@ -29,7 +29,7 @@ import (
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/genai"
 
-	genaianthropic "github.com/achetronic/adk-utils-go/genai/anthropic"
+	genaianthropic "github.com/zed7th/adk-utils-go/genai/anthropic"
 )
 
 func main() {
