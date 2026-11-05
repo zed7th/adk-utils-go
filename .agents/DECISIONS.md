@@ -363,6 +363,11 @@ consumers.
 requires it). `buildMessageParams` defaults `MaxTokens` to 4096 when the caller
 doesn't set `MaxOutputTokens` (Anthropic requires a non-zero `max_tokens`).
 
+schema 的根级关键字除 `type`、`properties`、`required` 外一律经 `ExtraFields` 原样透传
+(`$defs`、`additionalProperties`、根级 `description` 等):`properties` 里的 `$ref` 指向根级
+`$defs`,只拷 `properties` 会让引用悬空。转换在 JSON 往返得到的副本上做,类型小写化不改写调用方的
+声明(同一份声明会被并发请求共用)。
+
 ### A7 - Role mapping: unknown roles fall back to `user`
 
 `convertRoleToAnthropic`: `user`->`user`, `model`->`assistant`, anything else

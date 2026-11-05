@@ -653,37 +653,36 @@ func (m *Model) convertTools(genaiTools []*genai.Tool) ([]anthropic.ToolUnionPar
 			// Type is required by Anthropic API, must be "object"
 			inputSchema.Type = "object"
 			if params != nil {
-				// ParametersJsonSchema is typically *jsonschema.Schema, not map[string]any.
-				// Marshal/unmarshal normalises any concrete type into a plain map so we
-				// can extract fields generically. If it is already a map (e.g. built by
-				// hand in Go) we use it directly to avoid the round-trip.
+				// 一律经 JSON 往返得到独立副本:schema 可能是 *jsonschema.Schema、*genai.Schema
+				// 或 map,往返后统一成普通 map;下面的类型小写化会改写 map,不能动调用方的声明
+				// (同一份声明会被并发请求共用)。
 				var m map[string]any
-				if dm, ok := params.(map[string]any); ok {
-					m = dm
-				} else {
-					jsonBytes, err := json.Marshal(params)
-					if err == nil {
-						json.Unmarshal(jsonBytes, &m) //nolint:errcheck
-					}
+				if jsonBytes, err := json.Marshal(params); err == nil {
+					json.Unmarshal(jsonBytes, &m) //nolint:errcheck
 				}
 				if m != nil {
 					lowercaseTypes(m)
 					if props, ok := m["properties"]; ok {
 						inputSchema.Properties = props
 					}
-					// After json.Unmarshal, string arrays always arrive as []interface{},
-					// never []string, regardless of the source type. We handle both to be
-					// defensive: []string covers maps built directly in Go without a JSON
-					// round-trip; []interface{} covers the normal unmarshal path.
-					switch req := m["required"].(type) {
-					case []string:
-						inputSchema.Required = req
-					case []interface{}:
+					if req, ok := m["required"].([]any); ok {
 						strs := make([]string, len(req))
 						for i, v := range req {
 							strs[i] = fmt.Sprint(v)
 						}
 						inputSchema.Required = strs
+					}
+					// 根级其余关键字原样透传($defs、additionalProperties、description 等):
+					// properties 里的 $ref 指向根级 $defs,丢掉它引用就悬空了。
+					for k, v := range m {
+						switch k {
+						case "type", "properties", "required":
+							continue
+						}
+						if inputSchema.ExtraFields == nil {
+							inputSchema.ExtraFields = make(map[string]any)
+						}
+						inputSchema.ExtraFields[k] = v
 					}
 				}
 			}

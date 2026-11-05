@@ -203,3 +203,45 @@ func TestLowercaseTypes(t *testing.T) {
 		})
 	}
 }
+
+// 根级除 type、properties、required 外的关键字进 ExtraFields 原样透传,$defs 里的类型同样小写化;
+// 转换在副本上做,调用方传入的 map 不被改写。
+func TestConvertTools_ForwardsRootKeywordsWithoutMutatingInput(t *testing.T) {
+	m := &Model{modelName: "test-model"}
+	params := map[string]any{
+		"type":                 "OBJECT",
+		"description":          "Compose sections.",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"sections": map[string]any{"type": "ARRAY", "items": map[string]any{"$ref": "#/$defs/section"}},
+		},
+		"$defs": map[string]any{
+			"section": map[string]any{"type": "OBJECT"},
+		},
+	}
+
+	got, err := m.convertTools([]*genai.Tool{{FunctionDeclarations: []*genai.FunctionDeclaration{{
+		Name:                 "compose",
+		ParametersJsonSchema: params,
+	}}}})
+	if err != nil {
+		t.Fatalf("convertTools error: %v", err)
+	}
+
+	extra := got[0].OfTool.InputSchema.ExtraFields
+	want := map[string]any{
+		"description":          "Compose sections.",
+		"additionalProperties": false,
+		"$defs":                map[string]any{"section": map[string]any{"type": "object"}},
+	}
+	if !reflect.DeepEqual(extra, want) {
+		t.Errorf("ExtraFields:\n got = %#v\nwant = %#v", extra, want)
+	}
+
+	if params["type"] != "OBJECT" {
+		t.Errorf("caller schema type rewritten to %v", params["type"])
+	}
+	if def := params["$defs"].(map[string]any)["section"].(map[string]any); def["type"] != "OBJECT" {
+		t.Errorf("caller $defs type rewritten to %v", def["type"])
+	}
+}

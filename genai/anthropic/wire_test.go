@@ -22,6 +22,15 @@ import (
 // faithful way to assert on it is to inspect the real outgoing request).
 func captureBody(t *testing.T, cfg Config) map[string]any {
 	t.Helper()
+	return captureRequestBody(t, cfg, &model.LLMRequest{
+		Config:   &genai.GenerateContentConfig{},
+		Contents: []*genai.Content{{Role: "user", Parts: []*genai.Part{{Text: "hi"}}}},
+	})
+}
+
+// captureRequestBody 同 captureBody,发送调用方给的请求。
+func captureRequestBody(t *testing.T, cfg Config, req *model.LLMRequest) map[string]any {
+	t.Helper()
 
 	var captured []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -39,10 +48,6 @@ func captureBody(t *testing.T, cfg Config) map[string]any {
 	}
 	m := New(cfg)
 
-	req := &model.LLMRequest{
-		Config:   &genai.GenerateContentConfig{},
-		Contents: []*genai.Content{{Role: "user", Parts: []*genai.Part{{Text: "hi"}}}},
-	}
 	for _, err := range m.GenerateContent(context.Background(), req, false) {
 		if err != nil {
 			t.Fatalf("GenerateContent: %v", err)
@@ -97,6 +102,55 @@ func TestWireBody_Enabled(t *testing.T) {
 	}
 	if _, present := body["output_config"]; present {
 		t.Errorf("classic mode must not send output_config, got %v", body["output_config"])
+	}
+}
+
+// 工具 schema 的根级关键字要原样上线:properties 里的 $ref 指向根级 $defs,
+// $defs 必须随 input_schema 一起发出,引用才不悬空。
+func TestWireBody_ToolSchemaKeepsRootKeywords(t *testing.T) {
+	req := &model.LLMRequest{
+		Config: &genai.GenerateContentConfig{Tools: []*genai.Tool{{
+			FunctionDeclarations: []*genai.FunctionDeclaration{{
+				Name: "compose",
+				ParametersJsonSchema: map[string]any{
+					"type":                 "object",
+					"description":          "Compose sections.",
+					"additionalProperties": false,
+					"required":             []any{"sections"},
+					"properties": map[string]any{
+						"sections": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/$defs/section"}},
+					},
+					"$defs": map[string]any{
+						"section": map[string]any{"type": "object", "properties": map[string]any{"title": map[string]any{"type": "string"}}},
+					},
+				},
+			}},
+		}}},
+		Contents: []*genai.Content{{Role: "user", Parts: []*genai.Part{{Text: "hi"}}}},
+	}
+	body := captureRequestBody(t, Config{}, req)
+
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %v, want one tool", body["tools"])
+	}
+	schema := tools[0].(map[string]any)["input_schema"].(map[string]any)
+	if schema["type"] != "object" {
+		t.Errorf("input_schema.type = %v, want \"object\"", schema["type"])
+	}
+	defs, ok := schema["$defs"].(map[string]any)
+	if !ok || defs["section"] == nil {
+		t.Fatalf("input_schema.$defs = %v, want the section definition", schema["$defs"])
+	}
+	if schema["additionalProperties"] != false {
+		t.Errorf("input_schema.additionalProperties = %v, want false", schema["additionalProperties"])
+	}
+	if schema["description"] != "Compose sections." {
+		t.Errorf("input_schema.description = %v, want the root description", schema["description"])
+	}
+	items := schema["properties"].(map[string]any)["sections"].(map[string]any)["items"].(map[string]any)
+	if items["$ref"] != "#/$defs/section" {
+		t.Errorf("sections.items.$ref = %v, want \"#/$defs/section\"", items["$ref"])
 	}
 }
 
