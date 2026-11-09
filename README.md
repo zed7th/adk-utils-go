@@ -559,8 +559,8 @@ go run ./examples/openai-client
 
 ## Requirements
 
-- Go 1.24+
-- [Google ADK](https://google.github.io/adk-docs/) v0.5.0+
+- Go 1.27.3+
+- [Google ADK](https://google.github.io/adk-docs/) v2.7.1+
 
 ## License
 

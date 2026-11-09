@@ -14,14 +14,14 @@ Agent guidelines for working in the `adk-utils-go` repository.
 A Go library providing utilities for Google's Agent Development Kit (ADK). This library extends ADK with additional backend implementations for topics like session management or memory services.
 
 **Module**: `github.com/zed7th/adk-utils-go` (see `go.mod`)  
-**Go Version**: 1.24.9+ (toolchain 1.25.5)  
-**ADK Version**: v1.4.0
+**Go Version**: 1.27.3+  
+**ADK Version**: v2.7.1 (`google.golang.org/adk/v2`)
 
 ### Key Dependencies
 
 | Package                        | Purpose                                            |
 | ------------------------------ | -------------------------------------------------- |
-| `google.golang.org/adk`        | Google ADK core framework                          |
+| `google.golang.org/adk/v2`     | Google ADK core framework                          |
 | `google.golang.org/genai`      | Google GenAI types                                 |
 | `github.com/redis/go-redis/v9` | Redis client for session storage                   |
 | `github.com/lib/pq`            | PostgreSQL driver for memory storage               |
